@@ -253,8 +253,8 @@ def wrap_with_spinner(widget, dim_shape="none"):
     return overlay, spinner
 
 
-def create_accent_placeholder_paintable(width, height, alpha=0.4):
-    r, g, b = get_effective_accent_rgb()
+def create_accent_placeholder_paintable(width, height, alpha=0.4, rgb=None):
+    r, g, b = rgb if rgb is not None else get_effective_accent_rgb()
 
     w = width * HIDPI_SCALE
     h = height * HIDPI_SCALE
@@ -476,6 +476,17 @@ def build_grid(margin_top=True, margin_bottom=True, column_homogeneous=False):
     return grid
 
 
+def track_cell_editing(renderer):
+    state = {"editable": None}
+
+    def on_editing_started(r, editable, path):
+        state["editable"] = editable
+        editable.connect("remove-widget", lambda e: state.update(editable=None))
+
+    renderer.connect("editing-started", on_editing_started)
+    return lambda: state["editable"] and state["editable"].editing_done()
+
+
 def build_bottom_button_box(button_cancel, button_ok):
     bottom_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
     bottom_box.set_homogeneous(True)
@@ -494,6 +505,7 @@ def build_dialog_ok_cancel_box(dialog):
 
     button_ok = Gtk.Button(label=_("Ok"))
     button_ok.set_hexpand(True)
+    button_ok.set_focus_on_click(False)
     button_ok.connect("clicked", lambda b: dialog.response(Gtk.ResponseType.OK))
 
     return build_bottom_button_box(button_cancel, button_ok)
@@ -1047,6 +1059,10 @@ def update_games_json():
             game["runner"] = "Proton-CachyOS (System)"
             changed = True
 
+        if game.get("disable_umu") and game.get("runtime") != "disable-runtime":
+            game["runtime"] = "disable-runtime"
+            changed = True
+
         if "favorite" in game:
             if game["favorite"] == True:
                 game["category"] = False
@@ -1101,25 +1117,32 @@ def populate_combobox_with_runners(combobox):
     if os.path.exists(PROTON_CACHYOS):
         combobox.append("Proton-CachyOS (System)", "Proton-CachyOS ({})".format(_("System")))
 
+    reserved_names = (
+        "UMU-Latest", "LegacyRuntime",
+        "Proton-GE Latest", "Proton-EM Latest",
+        "DW-Proton Latest", "Proton-CachyOS Latest",
+    )
+
     try:
-        versions = set()
+        flatpak_dir = COMPATIBILITY_DIRS[-1] if len(COMPATIBILITY_DIRS) > 1 else None
+        versions = {}
         for compat_dir in COMPATIBILITY_DIRS:
             if not os.path.exists(compat_dir):
                 continue
             for entry in os.listdir(compat_dir):
                 entry_path = os.path.join(compat_dir, entry)
-                if (
-                    os.path.isdir(entry_path)
-                    and entry not in (
-                        "UMU-Latest", "LegacyRuntime",
-                        "Proton-GE Latest", "Proton-EM Latest",
-                        "DW-Proton Latest", "Proton-CachyOS Latest",
-                    )
-                ):
-                    versions.add(entry)
+                if not os.path.isdir(entry_path):
+                    continue
+                if entry in reserved_names:
+                    if compat_dir == flatpak_dir:
+                        combobox.append(entry_path, f"{entry} ({_('Flatpak')})")
+                    continue
+                if entry not in versions:
+                    versions[entry] = compat_dir
 
         for version in sorted(versions, key=version_key, reverse=True):
-            combobox.append(version, version)
+            label = f"{version} ({_('Flatpak')})" if versions[version] == flatpak_dir else version
+            combobox.append(version, label)
     except Exception as e:
         print(f"Error accessing the directory: {e}")
 
@@ -1138,7 +1161,7 @@ GAME_FIELDS = [
     "lossless_performance", "lossless_hdr", "lossless_present",
     "playtime", "hidden", "no_sleep", "category", "icon",
     "steamgriddb_id", "pre_launch", "post_launch",
-    "steam_user", "disable_umu",
+    "steam_user", "disable_umu", "runtime",
 ]
 
 
@@ -1232,6 +1255,8 @@ def show_launch_arguments_dialog(parent, current_launch_arguments, current_pre_l
             return True
         return False
 
+    commit_presets_edit = track_cell_editing(renderer_presets)
+
     renderer_presets.connect("edited", on_preset_edited)
     key_controller_presets = Gtk.EventControllerKey()
     key_controller_presets.connect("key-pressed", on_preset_key_press)
@@ -1317,6 +1342,8 @@ def show_launch_arguments_dialog(parent, current_launch_arguments, current_pre_l
                     model.append([""])
             return True
         return False
+
+    commit_args_edit = track_cell_editing(renderer_args)
 
     renderer_args.connect("edited", on_arg_edited)
     key_controller_args = Gtk.EventControllerKey()
@@ -1499,6 +1526,9 @@ def show_launch_arguments_dialog(parent, current_launch_arguments, current_pre_l
         pre_launch = current_pre_launch
         post_launch = current_post_launch
         if response == Gtk.ResponseType.OK:
+            commit_presets_edit()
+            commit_args_edit()
+
             presets_to_save = [row[0] for row in store_presets if row[0].strip()]
             save_json_file(presets_to_save, PRESETS_FILE)
 

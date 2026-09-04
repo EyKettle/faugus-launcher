@@ -22,7 +22,7 @@ from faugus.ea_fix import *
 from faugus.migration import fix_legacy_shortcut_icons
 from faugus.main_screen_nav import adjust_widget_value, carrousel_move_coalesced, focus_bottom_bar_by_column, focus_flowbox_child, focus_top_bar, navigate_focus
 
-VERSION = "2.2.0"
+VERSION = "2.2.1"
 
 if IS_FLATPAK:
     tray_icon = 'io.github.Faugus.faugus-launcher'
@@ -300,15 +300,7 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
             self.startup_window_size = "Fullscreen"
 
         placeholder_r, placeholder_g, placeholder_b = self.get_accent_rgb()
-        add_css_once(
-            "placeholder_accent",
-            f"""
-            .cover-placeholder,
-            .banner-placeholder {{
-                background-color: rgba({placeholder_r}, {placeholder_g}, {placeholder_b}, 0.4);
-            }}
-            """,
-        )
+        self.update_placeholder_accent_css()
 
         if self.theme_engine != "adwaita":
             add_css_once(
@@ -432,6 +424,36 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
         css = f".accent-background {{ background-color: rgb({fade_r}, {fade_g}, {fade_b}); }}"
         self._accent_background_provider.load_from_data(css.encode("utf-8"))
 
+    def update_placeholder_accent_css(self):
+        r, g, b = self.get_accent_rgb()
+
+        if getattr(self, "_placeholder_accent_provider", None) is None:
+            self._placeholder_accent_provider = Gtk.CssProvider()
+            Gtk.StyleContext.add_provider_for_display(
+                Gdk.Display.get_default(), self._placeholder_accent_provider, Gtk.STYLE_PROVIDER_PRIORITY_USER + 1
+            )
+
+        css = f"""
+        .cover-placeholder,
+        .banner-placeholder,
+        .cover-empty {{
+            background-color: rgba({r}, {g}, {b}, 0.4);
+        }}
+        """
+        self._placeholder_accent_provider.load_from_data(css.encode("utf-8"))
+
+    def refresh_placeholder_covers(self):
+        if hasattr(self, 'flowbox'):
+            for child in widget_children(self.flowbox):
+                game = getattr(child, 'game', None)
+                if game and not os.path.isfile(game.cover):
+                    self.update_game_visual(child)
+
+        for slot in getattr(self, 'carrousel_slots', []):
+            game = getattr(slot['box'], 'game', None)
+            if game and not os.path.isfile(game.cover):
+                self.set_carrousel_slot_content(slot, game)
+
     def apply_popover_background_mode(self, popover, game=None):
         if self.theme_engine != "adwaita":
             return
@@ -482,6 +504,7 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
         self._bg_content_widget = content_widget
         self._bg_no_overlay_widget = None
         self._bg_base_box = None
+        content_widget.remove_css_class("accent-background")
 
         if not show_banner and base_mode != "dominant_color":
             if base_mode == "accent":
@@ -782,7 +805,7 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
         self.update_launcher_banner_css()
 
         if old_had_overlay:
-            self.schedule_background_update()
+            self.update_background()
 
         return True
 
@@ -808,9 +831,13 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
         wrapper.append(self.build_background_container(content_widget))
 
         if self.banner_overlay_enabled() or self.background_mode == "dominant_color":
-            self.schedule_background_update()
+            self.apply_background_update_now()
 
         return True
+
+    def apply_background_update_now(self):
+        self.update_launcher_banner_css()
+        self.update_background()
 
     def schedule_background_update(self):
         self.update_launcher_banner_css()
@@ -1085,6 +1112,13 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
                 if g.title == title:
                     self.carrousel_index = i
                     self.render_carrousel()
+
+                    def grab_carrousel_focus():
+                        if hasattr(self, 'carrousel_fixed'):
+                            self.carrousel_fixed.grab_focus()
+                        return False
+
+                    GLib.idle_add(grab_carrousel_focus)
                     return
             return
 
@@ -1288,6 +1322,7 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
         self.scale_zoom = Gtk.Scale(orientation=Gtk.Orientation.HORIZONTAL, adjustment=adjustment)
         self.scale_zoom.set_size_request(150, -1)
         self.scale_zoom.set_draw_value(True)
+        self.scale_zoom.set_value_pos(Gtk.PositionType.LEFT)
         self.scale_zoom.set_digits(0)
         self.scale_zoom.set_margin_end(10)
 
@@ -1744,10 +1779,17 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
         deco_entry.add_css_class("game")
         deco_entry.add_css_class("list-row-entry")
 
+        anim_box = Gtk.Box()
+        anim_box.add_css_class("launch-overlay")
+        anim_box.set_hexpand(True)
+        anim_box.set_vexpand(True)
+        anim_box.set_can_target(False)
+
         card_overlay = Gtk.Overlay()
         card_overlay.set_child(deco_entry)
         card_overlay.add_overlay(hbox)
         card_overlay.set_measure_overlay(hbox, True)
+        card_overlay.add_overlay(anim_box)
 
         card = GObject.new(Gtk.Box, css_name="entry")
         card.append(card_overlay)
@@ -1764,6 +1806,7 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
             "card": card,
             "picture": picture,
             "label": label,
+            "anim_box": anim_box,
             "style_provider": style_provider,
             "offset": offset,
             "gameid": None,
@@ -1890,6 +1933,30 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
             return 2
         return 3
 
+    def carrousel_fit_radius(self, n, width):
+        max_radius = self.carrousel_radius_for_count(n)
+        if max_radius <= 1 or not width or not self.carrousel_step:
+            return max_radius
+        fit = int((width / self.carrousel_step - 1) / 2)
+        return max(1, min(max_radius, fit))
+
+    def place_carrousel_slot_base(self, slot):
+        _, natural_w, _, _ = slot["box"].measure(Gtk.Orientation.HORIZONTAL, -1)
+        _, natural_h, _, _ = slot["box"].measure(Gtk.Orientation.VERTICAL, natural_w)
+        base_x = self.carrousel_center_x - natural_w / 2
+        base_y = self.carrousel_center_y - natural_h / 2
+        self.carrousel_fixed.move(slot["box"], base_x, base_y)
+
+    def update_carrousel_layout(self, width):
+        if not width or not self.carrousel_step or not getattr(self, 'carrousel_slots', None):
+            return
+        self.carrousel_center_x = width / 2
+        n = len(self.carrousel_visible_games())
+        self.carrousel_radius = self.carrousel_fit_radius(n, width)
+        for slot in self.carrousel_slots:
+            self.place_carrousel_slot_base(slot)
+            self.layout_carrousel_slot(slot, slot.get("visual_offset", slot["offset"]))
+
     def on_carrousel_focus_changed(self, widget, pspec):
         for slot in getattr(self, 'carrousel_slots', []):
             self.layout_carrousel_slot(slot, slot.get("visual_offset", slot["offset"]))
@@ -1909,7 +1976,7 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
             slot["_can_target"] = can_target
 
         carrousel_fixed = getattr(self, 'carrousel_fixed', None)
-        is_focused = carrousel_fixed is not None and carrousel_fixed.is_focus()
+        is_focused = carrousel_fixed is not None and carrousel_fixed.get_property("has-focus")
         if not is_focused and d < 0.5:
             scale = 1.0
 
@@ -1938,7 +2005,7 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
         outer = Gtk.Fixed()
         outer.set_can_focus(True)
         outer.set_focusable(True)
-        outer.set_halign(Gtk.Align.CENTER)
+        outer.set_halign(Gtk.Align.FILL)
         outer.set_valign(Gtk.Align.CENTER)
         outer.set_hexpand(True)
         outer.set_overflow(Gtk.Overflow.HIDDEN)
@@ -1971,7 +2038,16 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
         for slot in self.carrousel_slots:
             outer.put(slot["box"], 0, 0)
 
+        self.connect_carrousel_resize()
+
         return outer
+
+    def connect_carrousel_resize(self):
+        surface = self.get_surface()
+        if surface is not None:
+            surface.connect("notify::width", lambda s, p: self.update_carrousel_layout(s.get_width()))
+        else:
+            self.connect("realize", lambda w: self.connect_carrousel_resize())
 
     def render_carrousel(self):
         if not hasattr(self, 'carrousel_slots'):
@@ -1985,20 +2061,14 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
         self.carrousel_step = max_width + 20
         glow_margin = 40
         total_height = max_height + 50 + glow_margin * 2
-        self.carrousel_fixed.set_size_request(self.carrousel_step * 7, total_height)
-        self.carrousel_center_x = self.carrousel_step * 7 / 2
+        self.carrousel_fixed.set_size_request(self.carrousel_step * 3, total_height)
+        current_width = self.get_width() or self.carrousel_step * 3
+        self.carrousel_center_x = current_width / 2
         self.carrousel_center_y = total_height / 2
 
         games = self.carrousel_visible_games()
         n = len(games)
-        self.carrousel_radius = self.carrousel_radius_for_count(n)
-
-        def place_base(slot):
-            _, natural_w, _, _ = slot["box"].measure(Gtk.Orientation.HORIZONTAL, -1)
-            _, natural_h, _, _ = slot["box"].measure(Gtk.Orientation.VERTICAL, natural_w)
-            base_x = self.carrousel_center_x - natural_w / 2
-            base_y = self.carrousel_center_y - natural_h / 2
-            self.carrousel_fixed.move(slot["box"], base_x, base_y)
+        self.carrousel_radius = self.carrousel_fit_radius(n, current_width)
 
         if n == 0:
             for slot in self.carrousel_slots:
@@ -2006,7 +2076,7 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
                 slot["gameid"] = None
                 slot["label"].set_text("")
                 slot["box"].game = None
-                place_base(slot)
+                self.place_carrousel_slot_base(slot)
                 slot["box"].set_opacity(0.0)
                 slot["box"].set_can_target(False)
                 slot["_can_target"] = False
@@ -2019,7 +2089,7 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
         for slot in self.carrousel_slots:
             idx = (self.carrousel_index + slot["offset"]) % n
             self.set_carrousel_slot_content(slot, games[idx])
-            place_base(slot)
+            self.place_carrousel_slot_base(slot)
             self.layout_carrousel_slot(slot, slot["offset"])
 
         self.schedule_background_update()
@@ -2038,7 +2108,7 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
                 slot.pop("_settle_offset", None)
                 self.layout_carrousel_slot(slot, slot["offset"])
 
-        self.carrousel_radius = self.carrousel_radius_for_count(n)
+        self.carrousel_radius = self.carrousel_fit_radius(n, self.get_width())
         self.carrousel_index = (self.carrousel_index + delta) % n
 
         span = self.carrousel_max_offset - self.carrousel_min_offset + 1
@@ -3732,7 +3802,7 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
 
     def get_cover_paintable(self, game, width, height):
         if not os.path.isfile(game.cover):
-            return create_accent_placeholder_paintable(width, height)
+            return create_accent_placeholder_paintable(width, height, rgb=self.get_accent_rgb())
 
         texture = self.get_cover_texture(game.cover, self.is_game_installed(game))
         return HiDpiPaintable(texture, width, height)
@@ -3796,6 +3866,7 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
             os.execv(sys.executable, [sys.executable, '-m', 'faugus.launcher'] + sys.argv[1:])
 
         if response_id == Gtk.ResponseType.OK:
+            settings_dialog.commit_pending_envar_edit()
             default_prefix = settings_dialog.entry_default_prefix.get_text()
             validation_result = self.validate_settings_fields(settings_dialog, default_prefix)
             if not validation_result:
@@ -4112,7 +4183,9 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
             if game_runner == "Linux-Native":
                 edit_game_dialog.combobox_launcher.set_active_id_silent("linux")
                 edit_game_dialog.on_combobox_changed(edit_game_dialog.combobox_launcher, skip_cleanup=True)
-                edit_game_dialog.checkbox_disable_umu.set_active(game.disable_umu == True)
+                edit_game_dialog.combobox_runtime.set_active_id_silent(
+                    game.runtime or ("disable-runtime" if game.disable_umu else "umu-steamrt4")
+                )
             if game_runner == "Steam":
                 edit_game_dialog.combobox_launcher.set_active_id_silent("steam")
                 edit_game_dialog.on_combobox_changed(edit_game_dialog.combobox_launcher, skip_cleanup=True)
@@ -4472,7 +4545,7 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
                 no_sleep = True if add_game_dialog.checkbox_no_sleep.get_active() else ""
 
             disable_umu = True if (
-                launcher_id == "linux" and add_game_dialog.checkbox_disable_umu.get_active()
+                launcher_id == "linux" and add_game_dialog.combobox_runtime.get_active_id() == "disable-runtime"
             ) else ""
 
             game = Game(
@@ -4509,6 +4582,7 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
                 post_launch=add_game_dialog.post_launch,
                 steam_user=add_game_dialog.combobox_steam_user.get_active_id() if launcher_id == "steam" else "",
                 disable_umu=disable_umu,
+                runtime=add_game_dialog.combobox_runtime.get_active_id()
             )
 
             desktop_shortcut_state = add_game_dialog.checkbox_shortcut_desktop.get_active()
@@ -4870,7 +4944,8 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
 
             if edit_game_dialog.combobox_launcher.get_active_id() == "linux":
                 game.runner = "Linux-Native"
-                game.disable_umu = True if edit_game_dialog.checkbox_disable_umu.get_active() else ""
+                game.runtime = edit_game_dialog.combobox_runtime.get_active_id()
+                game.disable_umu = True if game.runtime == "disable-runtime" else ""
             else:
                 game.disable_umu = ""
             if edit_game_dialog.combobox_launcher.get_active_id() == "steam":
@@ -4897,7 +4972,7 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
 
             self.select_game_by_title(game.title)
             self.launcher_banner_dominant_rgb = None
-            self.schedule_background_update()
+            self.apply_background_update_now()
         else:
             if os.path.isfile(edit_game_dialog.icon_temp):
                 os.remove(edit_game_dialog.icon_temp)
@@ -5503,6 +5578,7 @@ class Settings(Gtk.Dialog):
         self.button_ok = Gtk.Button(label=_("Ok"))
         self.button_ok.connect("clicked", lambda widget: self.response(Gtk.ResponseType.OK))
         self.button_ok.set_hexpand(True)
+        self.button_ok.set_focus_on_click(False)
 
         self.label_settings = Gtk.Label(label=_("Backup/Restore Settings"))
         self.label_settings.set_halign(Gtk.Align.START)
@@ -5536,6 +5612,7 @@ class Settings(Gtk.Dialog):
         renderer.set_property("editable", True)
         renderer.set_property("ellipsize", 3)
         renderer.connect("edited", self.on_cell_edited, 0)
+        self.commit_pending_envar_edit = track_cell_editing(renderer)
 
         column = Gtk.TreeViewColumn("", renderer, text=0)
         treeview.set_headers_visible(False)
@@ -5891,8 +5968,20 @@ class Settings(Gtk.Dialog):
 
         apply_interface_customization(self.interface_theme, self.accent_color, self.theme_engine)
 
-        if hasattr(self.parent, 'schedule_background_update'):
-            self.parent.schedule_background_update()
+        self.parent.interface_theme = self.interface_theme
+        self.parent.accent_color = self.accent_color
+
+        if hasattr(self.parent, 'update_placeholder_accent_css'):
+            self.parent.update_placeholder_accent_css()
+
+        if hasattr(self.parent, 'refresh_placeholder_covers'):
+            self.parent.refresh_placeholder_covers()
+
+        if self.parent.background_mode == "accent" and hasattr(self.parent, 'update_accent_background_css'):
+            self.parent.update_accent_background_css()
+
+        if hasattr(self.parent, 'apply_background_update_now'):
+            self.parent.apply_background_update_now()
 
     def on_background_changed(self, widget):
         new_mode = self.combobox_background.get_active_id()
@@ -6363,6 +6452,10 @@ class Settings(Gtk.Dialog):
         self.combobox_startup_window_size.set_active_id(startup_window_size)
 
         index_language = 0
+        for i, lang_code in enumerate(self.combobox_language.get_ids()):
+            if lang_code == "en_US":
+                index_language = i
+                break
 
         if self.language != "":
             language_primary = self.language.split("_")[0].split("-")[0].lower()
@@ -6421,6 +6514,7 @@ class Game:
         post_launch="",
         steam_user="",
         disable_umu="",
+        runtime="",
     ):
         self.gameid = gameid
         self.title = title
@@ -6450,11 +6544,13 @@ class Game:
         self.no_sleep = no_sleep
         self.category = category
         self.icon = icon
+        self.runtime = runtime
         self.steamgriddb_id = steamgriddb_id
         self.pre_launch = pre_launch
         self.post_launch = post_launch
         self.steam_user = steam_user
         self.disable_umu = disable_umu
+        self.runtime = runtime
 
 
 class DuplicateDialog(Gtk.Dialog):
@@ -6665,6 +6761,8 @@ class AddGame(Gtk.Dialog, HiDpiMixin):
 
         self.grid_path = build_grid(margin_bottom=False)
 
+        self.grid_runtime = build_grid(margin_bottom=False)
+
         self.grid_prefix = build_grid(margin_bottom=False)
 
         self.grid_runner = build_grid(margin_bottom=False)
@@ -6685,16 +6783,6 @@ class AddGame(Gtk.Dialog, HiDpiMixin):
         self.grid_addapp = build_grid(margin_bottom=False)
 
         self.grid_tools = build_grid()
-
-        cover_placeholder_r, cover_placeholder_g, cover_placeholder_b = self.parent_window.get_accent_rgb()
-        add_css_once(
-            "addgame_cover_empty",
-            f"""
-            .cover-empty {{
-                background-color: rgba({cover_placeholder_r}, {cover_placeholder_g}, {cover_placeholder_b}, 0.4);
-            }}
-            """,
-        )
 
         add_css_once("addgame_dialog", """
         .entry {
@@ -6819,6 +6907,12 @@ class AddGame(Gtk.Dialog, HiDpiMixin):
         self.button_search.connect("clicked", self.on_button_search_clicked)
         self.button_search.set_size_request(50, -1)
 
+        self.label_runtime = Gtk.Label(label=_("Runtime"))
+        self.label_runtime.set_halign(Gtk.Align.START)
+        self.label_runtime.set_visible(False)
+        self.combobox_runtime = IdComboBox()
+        self.combobox_runtime.set_visible(False)
+
         self.label_prefix = Gtk.Label(label=_("Prefix"))
         self.label_prefix.set_halign(Gtk.Align.START)
         self.entry_prefix = Gtk.Entry()
@@ -6862,10 +6956,6 @@ class AddGame(Gtk.Dialog, HiDpiMixin):
         self.button_lossless.connect("clicked", self.on_button_lossless_clicked)
 
         create_mangohud_gamemode_checkboxes(self)
-        self.checkbox_disable_umu = Gtk.CheckButton(label=_("Disable UMU"))
-        self.checkbox_disable_umu.set_tooltip_text(
-            _("Runs the game without the Steam Runtime"))
-        self.checkbox_disable_umu.set_visible(False)
         self.checkbox_sdl = Gtk.CheckButton(label="SDL")
         self.checkbox_sdl.set_tooltip_text(_("May fix gamepad issues with some games"))
         self.checkbox_no_sleep = Gtk.CheckButton(label=_("No Sleep"))
@@ -7166,8 +7256,10 @@ class AddGame(Gtk.Dialog, HiDpiMixin):
         self.grid_path.attach(self.entry_path, 0, 1, 3, 1)
         self.entry_path.set_hexpand(True)
         self.grid_path.attach(self.button_search, 3, 1, 1, 1)
-        self.grid_path.attach(self.checkbox_disable_umu, 0, 2, 4, 1)
-        self.checkbox_disable_umu.set_hexpand(True)
+
+        self.grid_runtime.attach(self.label_runtime, 0, 0, 1, 1)
+        self.grid_runtime.attach(self.combobox_runtime, 0, 1, 1, 1)
+        self.combobox_runtime.set_hexpand(True)
 
         self.grid_prefix.attach(self.label_prefix, 0, 0, 1, 1)
         self.grid_prefix.attach(self.entry_prefix, 0, 1, 3, 1)
@@ -7195,6 +7287,7 @@ class AddGame(Gtk.Dialog, HiDpiMixin):
         page1.append(self.grid_steam_title)
         page1.append(self.grid_title)
         page1.append(self.grid_path)
+        page1.append(self.grid_runtime)
         page1.append(self.grid_prefix)
         page1.append(self.grid_runner)
         page1.append(self.label_shortcut)
@@ -7266,6 +7359,8 @@ class AddGame(Gtk.Dialog, HiDpiMixin):
         self.combobox_launcher.connect("changed", self.on_combobox_changed)
 
         self.populate_combobox_with_runners()
+        self.populate_combobox_with_runtimes()
+        self.combobox_runtime.set_active_id("umu-steamrt4")
 
         if not self.combobox_runner.set_active_id(self.default_runner):
             self.combobox_runner.set_active(0)
@@ -7904,7 +7999,6 @@ class AddGame(Gtk.Dialog, HiDpiMixin):
         self.checkbox_gamemode.set_active(self.default_gamemode)
         self.checkbox_sdl.set_active(self.default_sdl_enabled)
         self.checkbox_no_sleep.set_active(self.default_no_sleep)
-        self.checkbox_disable_umu.set_active(False)
         self.button_shortcut_icon.set_child(self.set_image_shortcut_icon())
         if os.path.isfile(self.cover_path_temp):
             os.remove(self.cover_path_temp)
@@ -7936,6 +8030,7 @@ class AddGame(Gtk.Dialog, HiDpiMixin):
         self.grid_steam_user.set_visible(False)
         self.grid_path.set_visible(False)
         self.grid_runner.set_visible(False)
+        self.grid_runtime.set_visible(False)
         self.grid_prefix.set_visible(False)
         self.button_winetricks.set_visible(False)
         self.button_winecfg.set_visible(False)
@@ -7943,10 +8038,10 @@ class AddGame(Gtk.Dialog, HiDpiMixin):
         self.grid_protonfix.set_visible(False)
         self.grid_addapp.set_visible(False)
         self.checkbox_sdl.set_visible(False)
-        self.checkbox_disable_umu.set_visible(False)
         self.checkbox_no_sleep.set_visible(True)
         self.checkbox_shortcut_steam.set_visible(True)
         self.combobox_steam_shortcut_user.set_visible(True)
+        self.combobox_runtime.set_visible(False)
         self.grid_page2.set_visible(True)
         self.tab_button_widgets[self.tab_names.index("page2")].set_visible(True)
         self.tab_switcher.set_visible(True)
@@ -7968,8 +8063,10 @@ class AddGame(Gtk.Dialog, HiDpiMixin):
         elif active_id == "linux":
             self.grid_title.set_visible(True)
             self.grid_path.set_visible(True)
+            self.grid_runtime.set_visible(True)
+            self.label_runtime.set_visible(True)
             self.button_shortcut_icon.set_visible(True)
-            self.checkbox_disable_umu.set_visible(True)
+            self.combobox_runtime.set_visible(True)
 
         elif active_id == "steam":
             self.grid_steam_title.set_visible(True)
@@ -8049,6 +8146,13 @@ class AddGame(Gtk.Dialog, HiDpiMixin):
         self.combobox_launcher.append("rockstar", "Rockstar Launcher")
         self.combobox_launcher.append("ubisoft", "Ubisoft Connect")
         self.combobox_launcher.append("wargaming", "Wargaming Game Center")
+
+    def populate_combobox_with_runtimes(self):
+        self.combobox_runtime.append("umu-steamrt4", "{} ({})".format(_("SteamRT4"), _("Default")))
+        self.combobox_runtime.append("umu-sniper", _("Sniper"))
+        self.combobox_runtime.append("umu-soldier", _("Soldier"))
+        self.combobox_runtime.append("umu-scout", _("Scout"))
+        self.combobox_runtime.append("disable-runtime", _("Disable Runtime"))
 
     def populate_combobox_with_runners(self):
         populate_combobox_with_runners(self.combobox_runner)

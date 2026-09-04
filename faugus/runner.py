@@ -121,7 +121,7 @@ class FaugusRun(HiDpiMixin):
 
     def start_process(self):
         if self.show_donate:
-            if self.playtime >= 7200:
+            if self.playtime >= 14400:
                 current_month = GLib.DateTime.new_now_local().format("%Y-%m")
 
                 if self.cfg.config.get("donate-last", "") != current_month:
@@ -195,12 +195,12 @@ class FaugusRun(HiDpiMixin):
                             os.remove(f"{target_dir}/{file}")
 
         if not os.environ.get("WINEPREFIX"):
-            if not os.environ.get("PROTONPATH") == "umu-sniper":
+            if not os.environ.get("PROTONPATH") in ["umu-steamrt4", "umu-sniper", "umu-soldier", "umu-scout", "umu-host"]:
                 set_env("WINEPREFIX", f"{self.default_prefix}/default")
                 set_env("PROTONPATH", f"{resolve_protonpath(self.default_runner)}")
 
         protonpath = os.environ.get("PROTONPATH")
-        if protonpath and protonpath != "Proton-GE Latest" and protonpath != "Proton-EM Latest" and protonpath != "Proton-CachyOS Latest" and protonpath != "DW-Proton Latest" and protonpath != "umu-sniper":
+        if protonpath and protonpath not in ["Proton-GE Latest", "Proton-EM Latest", "Proton-CachyOS Latest", "DW-Proton Latest", "umu-steamrt4", "umu-sniper", "umu-soldier", "umu-scout", "umu-host"]:
             if protonpath == "Proton-CachyOS (System)" and not os.path.exists(PROTON_CACHYOS):
                 self.close_splash_window()
                 self.show_error_dialog(protonpath)
@@ -788,6 +788,7 @@ def build_launch_command(game):
     lossless_present = game.get("lossless_present", "")
     icon = game.get("icon", "")
     disable_umu = bool(game.get("disable_umu", "")) and runner == "Linux-Native"
+    linux_runtime = game.get("runtime","")
 
     if gameid == "ea-app":
         path = update_ea_path(prefix)
@@ -807,14 +808,27 @@ def build_launch_command(game):
         command_parts.append(f"GAMEID={protonfix}")
     if runner:
         if runner == "Linux-Native":
-            if not disable_umu:
-                command_parts.append('PROTONPATH=umu-sniper')
+            if not disable_umu and linux_runtime:
+                command_parts.append(f"PROTONPATH={linux_runtime}")
         elif runner == "Proton-CachyOS (System)":
             command_parts.append(f"WINEPREFIX={shlex.quote(prefix)}")
             command_parts.append(f"PROTONPATH={PROTON_CACHYOS}")
         else:
             command_parts.append(f"WINEPREFIX={shlex.quote(prefix)}")
-            command_parts.append(f"PROTONPATH='{runner}'")
+            reserved_names = (
+                "Proton-GE Latest", "Proton-EM Latest",
+                "DW-Proton Latest", "Proton-CachyOS Latest",
+            )
+            if os.path.isdir(runner):
+                command_parts.append(f"PROTONPATH={shlex.quote(runner)}")
+            elif runner in reserved_names:
+                command_parts.append(f"PROTONPATH='{runner}'")
+            else:
+                resolved_runner = find_compatibilitytool(runner)
+                if resolved_runner and len(COMPATIBILITY_DIRS) > 1 and resolved_runner.parent == COMPATIBILITY_DIRS[-1]:
+                    command_parts.append(f"PROTONPATH={shlex.quote(str(resolved_runner))}")
+                else:
+                    command_parts.append(f"PROTONPATH='{runner}'")
     else:
         command_parts.append(f"WINEPREFIX={shlex.quote(prefix)}")
     command_parts.extend(build_lossless_env(lossless_enabled, lossless_multiplier, lossless_flow, lossless_performance, lossless_hdr, lossless_present))
