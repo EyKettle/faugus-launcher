@@ -54,6 +54,13 @@ VARIANTS = {
         "archive_ext": ["x86_64.tar.xz"],
         "tag_to_display": lambda tag: f"DW-Proton-{tag.removeprefix('dwproton-')}",
     },
+    "wineland": {
+        "tab_label": "Proton-Wineland",
+        "api_url": "https://api.github.com/repos/nanomatters/proton-cachyos/releases",
+        "tag_prefix": "",
+        "archive_ext": ["x86_64.tar.xz"],
+        "tag_to_display": lambda tag: f"Proton-Wineland-{tag.removeprefix('cachyos-wineland-').removeprefix('wineland-')}",
+    },
 }
 
 
@@ -88,6 +95,7 @@ class ProtonDownloader(Gtk.Dialog):
         self.set_modal(True)
 
         self.closed_event = threading.Event()
+        self.fetched_variants = set()
 
         self.content_area = self.get_content_area()
         self.content_area.set_halign(Gtk.Align.CENTER)
@@ -98,6 +106,7 @@ class ProtonDownloader(Gtk.Dialog):
         self.view_stack = Gtk.Stack()
         self.view_stack.set_halign(Gtk.Align.FILL)
         self.view_stack.set_valign(Gtk.Align.FILL)
+        self.view_stack.set_vhomogeneous(False)
         self.view_stack.set_vexpand(True)
         self.view_stack.set_hexpand(True)
 
@@ -106,10 +115,7 @@ class ProtonDownloader(Gtk.Dialog):
         self.tab_switcher.set_margin_top(10)
         self.tab_switcher.set_margin_start(10)
         self.tab_switcher.set_margin_end(10)
-        self.tab_switcher.connect(
-            "changed",
-            lambda combo: self.view_stack.set_visible_child_name(combo.get_active_id())
-        )
+        self.tab_switcher.connect("changed", self.on_tab_switcher_changed)
 
         content_scroll = Gtk.ScrolledWindow()
         content_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
@@ -134,6 +140,7 @@ class ProtonDownloader(Gtk.Dialog):
         for key, variant in VARIANTS.items():
             grid = Gtk.Grid()
             grid.set_hexpand(True)
+            grid.set_valign(Gtk.Align.CENTER)
             grid.set_row_spacing(5)
             grid.set_column_spacing(20)
             grid.set_margin_start(10)
@@ -148,12 +155,18 @@ class ProtonDownloader(Gtk.Dialog):
 
         self.tab_switcher.set_active(0)
 
-        self.get_releases()
+        self.ensure_releases_fetched(self.tab_switcher.get_active_id())
 
-    def get_releases(self):
-        closed_event = self.closed_event
-        for key, variant in VARIANTS.items():
-            run_in_background(self.fetch_releases_from_url, variant, self.grids[key], closed_event)
+    def on_tab_switcher_changed(self, combo):
+        key = combo.get_active_id()
+        self.view_stack.set_visible_child_name(key)
+        self.ensure_releases_fetched(key)
+
+    def ensure_releases_fetched(self, key):
+        if key is None or key in self.fetched_variants:
+            return
+        self.fetched_variants.add(key)
+        run_in_background(self.fetch_releases_from_url, VARIANTS[key], self.grids[key], self.closed_event)
 
     def fetch_releases_from_url(self, variant, grid, closed_event):
         page = 1

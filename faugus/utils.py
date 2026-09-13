@@ -331,12 +331,18 @@ class IdComboBox(Gtk.DropDown):
     def release(self):
         factory = self.get_factory()
         if factory:
-            factory.disconnect_by_func(self._on_factory_setup)
-            factory.disconnect_by_func(self._on_factory_bind)
+            try:
+                factory.disconnect_by_func(self._on_factory_setup)
+                factory.disconnect_by_func(self._on_factory_bind)
+            except TypeError:
+                pass
         list_factory = self.get_list_factory()
         if list_factory:
-            list_factory.disconnect_by_func(self._on_factory_setup)
-            list_factory.disconnect_by_func(self._list_factory_bind_func)
+            try:
+                list_factory.disconnect_by_func(self._on_factory_setup)
+                list_factory.disconnect_by_func(self._list_factory_bind_func)
+            except TypeError:
+                pass
         self.disconnect_by_func(self._on_notify_selected)
 
     def configure_ellipsize(self, max_width_chars=20):
@@ -487,13 +493,15 @@ def track_cell_editing(renderer):
     return lambda: state["editable"] and state["editable"].editing_done()
 
 
-def build_bottom_button_box(button_cancel, button_ok):
+def build_bottom_button_box(button_cancel, button_ok, *middle_buttons):
     bottom_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
     bottom_box.set_homogeneous(True)
     bottom_box.set_margin_start(10)
     bottom_box.set_margin_end(10)
     bottom_box.set_margin_bottom(10)
     bottom_box.append(button_cancel)
+    for button in middle_buttons:
+        bottom_box.append(button)
     bottom_box.append(button_ok)
     return bottom_box
 
@@ -681,6 +689,175 @@ def add_windows_file_filters(filechooser):
     filechooser.set_filter(windows_filter)
 
 
+def list_prefix_shortcuts(prefix):
+    roots = (
+        os.path.join(prefix, "drive_c", "users"),
+        os.path.join(prefix, "drive_c", "ProgramData"),
+    )
+    found = set()
+    for root in roots:
+        for dirpath, _dirnames, filenames in os.walk(root):
+            for filename in filenames:
+                if filename.lower().endswith(".lnk"):
+                    found.add(os.path.join(dirpath, filename))
+    return found
+
+
+def parse_lnk_target_path(lnk_path):
+    try:
+        with open(lnk_path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return None
+
+    if len(data) < 76 or data[:4] != b"\x4c\x00\x00\x00":
+        return None
+
+    link_flags = int.from_bytes(data[20:24], "little")
+    has_link_target_id_list = 0x01
+    has_link_info = 0x02
+
+    offset = 76
+    if link_flags & has_link_target_id_list:
+        if offset + 2 > len(data):
+            return None
+        id_list_size = int.from_bytes(data[offset:offset + 2], "little")
+        offset += 2 + id_list_size
+
+    if not (link_flags & has_link_info) or offset + 8 > len(data):
+        return None
+
+    link_info_start = offset
+    link_info_header_size = int.from_bytes(data[link_info_start + 4:link_info_start + 8], "little")
+    link_info_flags = int.from_bytes(data[link_info_start + 8:link_info_start + 12], "little")
+
+    volume_id_and_local_base_path = 0x01
+    if not (link_info_flags & volume_id_and_local_base_path):
+        return None
+
+    local_base_path_offset = int.from_bytes(data[link_info_start + 16:link_info_start + 20], "little")
+    local_base_path_offset_unicode = 0
+    if link_info_header_size >= 0x24 and link_info_start + 32 <= len(data):
+        local_base_path_offset_unicode = int.from_bytes(
+            data[link_info_start + 28:link_info_start + 32], "little"
+        )
+
+    if local_base_path_offset_unicode:
+        start = link_info_start + local_base_path_offset_unicode
+        end = data.find(b"\x00\x00", start)
+        if end == -1:
+            return None
+        if (end - start) % 2 != 0:
+            end += 1
+        try:
+            return data[start:end].decode("utf-16-le")
+        except UnicodeDecodeError:
+            return None
+
+    if local_base_path_offset:
+        start = link_info_start + local_base_path_offset
+        end = data.find(b"\x00", start)
+        if end == -1:
+            return None
+        try:
+            return data[start:end].decode("cp1252", errors="replace")
+        except UnicodeDecodeError:
+            return None
+
+    return None
+
+
+def windows_path_to_prefix_path(win_path, prefix):
+    win_path = win_path.strip().strip('"')
+    if len(win_path) < 2 or win_path[1] != ":":
+        return None
+    drive_letter = win_path[0].lower()
+    rest = re.sub(r'\\+', '/', win_path[2:]).lstrip("/")
+    if drive_letter == "c":
+        return os.path.join(prefix, "drive_c", rest)
+    dosdevice = os.path.join(prefix, "dosdevices", f"{drive_letter}:")
+    if os.path.islink(dosdevice):
+        return os.path.join(os.path.realpath(dosdevice), rest)
+    return None
+
+
+def resolve_case_insensitive_path(path):
+    if os.path.isfile(path):
+        return path
+
+    directory = os.path.dirname(path)
+    target_name = os.path.basename(path)
+    if not os.path.isdir(directory):
+        return None
+
+    try:
+        for entry in os.listdir(directory):
+            if entry.lower() == target_name.lower() and os.path.isfile(os.path.join(directory, entry)):
+                return os.path.join(directory, entry)
+    except OSError:
+        pass
+
+    return None
+
+
+_SHORTCUT_UTILITY_KEYWORDS = ("uninstall", "setup", "config", "readme")
+
+
+def is_utility_shortcut(*names):
+    combined = " ".join(n for n in names if n).lower()
+    return any(keyword in combined for keyword in _SHORTCUT_UTILITY_KEYWORDS)
+
+
+def resolve_new_shortcuts(prefix, shortcut_paths):
+    by_name = {}
+    for path in shortcut_paths:
+        by_name.setdefault(os.path.basename(path).lower(), []).append(path)
+
+    results = []
+    for paths in by_name.values():
+        name = os.path.splitext(os.path.basename(paths[0]))[0].strip()
+        if not name or is_utility_shortcut(os.path.basename(paths[0]), name):
+            continue
+
+        target = None
+        for lnk_path in paths:
+            target_win = parse_lnk_target_path(lnk_path)
+            if not target_win:
+                continue
+            candidate = windows_path_to_prefix_path(target_win, prefix)
+            resolved = resolve_case_insensitive_path(candidate) if candidate else None
+            if resolved and resolved.lower().endswith(".exe"):
+                target = resolved
+                break
+
+        if not target:
+            continue
+
+        dirs = [os.path.dirname(p).replace(os.sep, "/") for p in paths]
+        results.append({
+            "name": name,
+            "target": target,
+            "on_desktop": any("/Desktop" in d for d in dirs),
+            "on_appmenu": any("/Start Menu" in d for d in dirs),
+            "shortcut_path": paths[0],
+        })
+
+    return results
+
+
+def pick_best_shortcut(resolved):
+    if not resolved:
+        return None
+    return min(resolved, key=lambda r: r["name"].lower())
+
+
+def detect_installed_executable(prefix, existing_shortcuts):
+    new_shortcuts = list_prefix_shortcuts(prefix) - existing_shortcuts
+    resolved = resolve_new_shortcuts(prefix, new_shortcuts)
+    best = pick_best_shortcut(resolved)
+    return best["target"] if best else None
+
+
 def add_image_file_filters(filechooser, include_ico=True):
     image_filter = Gtk.FileFilter()
     image_filter.set_name(_("Image files"))
@@ -785,6 +962,12 @@ def show_message_dialog(text1, text2="", parent=None, confirm_label=None, cancel
     content_area.set_vexpand(True)
     content_area.set_hexpand(True)
 
+    frame = Gtk.Frame()
+    frame.set_margin_start(10)
+    frame.set_margin_end(10)
+    frame.set_margin_top(10)
+    frame.set_margin_bottom(10)
+
     box_top = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
     box_top.set_margin_start(20)
     box_top.set_margin_end(20)
@@ -817,7 +1000,9 @@ def show_message_dialog(text1, text2="", parent=None, confirm_label=None, cancel
     button_confirm.connect("clicked", lambda w: dialog.response(Gtk.ResponseType.OK))
     box_bottom.append(button_confirm)
 
-    content_area.append(box_top)
+    frame.set_child(box_top)
+
+    content_area.append(frame)
     content_area.append(box_bottom)
 
     def on_response(d, response_id):
@@ -1112,6 +1297,7 @@ def populate_combobox_with_runners(combobox):
     combobox.append("Proton-GE Latest", "GE-Proton {}".format(_("Latest")))
     combobox.append("Proton-EM Latest", "Proton-EM {}".format(_("Latest")))
     combobox.append("DW-Proton Latest", "DW-Proton {}".format(_("Latest")))
+    combobox.append("Proton-Wineland Latest", "Proton-Wineland {}".format(_("Latest")))
     combobox.append("", "UMU-Proton {}".format(_("Latest")))
 
     if os.path.exists(PROTON_CACHYOS):
@@ -1121,6 +1307,7 @@ def populate_combobox_with_runners(combobox):
         "UMU-Latest", "LegacyRuntime",
         "Proton-GE Latest", "Proton-EM Latest",
         "DW-Proton Latest", "Proton-CachyOS Latest",
+        "Proton-Wineland Latest",
     )
 
     try:
@@ -2257,7 +2444,19 @@ def show_steamgriddb_picker(obj, category):
     stack.add_named(scrolled, "content")
     stack.set_visible_child_name("loading")
 
-    dialog.get_content_area().append(stack)
+    search_entry = Gtk.SearchEntry()
+    search_entry.set_text(game_name)
+    search_entry.set_margin_start(10)
+    search_entry.set_margin_end(10)
+    search_entry.set_margin_top(10)
+
+    content_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+    content_box.set_vexpand(True)
+    content_box.set_hexpand(True)
+    content_box.append(search_entry)
+    content_box.append(stack)
+
+    dialog.get_content_area().append(content_box)
 
     thumb_w = 660 if is_list else 160
     thumb_h = int(thumb_w / ratios.get(category, 1.0))
@@ -2293,9 +2492,19 @@ def show_steamgriddb_picker(obj, category):
             GLib.idle_add(apply_ui)
         run_in_background(fetch_full)
 
-    def populate(items):
-        if closed_state[0]:
+    search_token = [0]
+
+    def clear_items():
+        child = items_container.get_first_child()
+        while child:
+            next_child = child.get_next_sibling()
+            items_container.remove(child)
+            child = next_child
+
+    def populate(items, token):
+        if closed_state[0] or token != search_token[0]:
             return False
+        clear_items()
         if not items:
             empty_label = Gtk.Label(label=_("No results found"))
             empty_label.set_margin_top(20)
@@ -2329,11 +2538,9 @@ def show_steamgriddb_picker(obj, category):
         stack.set_visible_child_name("content")
         return False
 
-    def fetch_candidates():
-        import requests
-
+    def fetch_candidates(term, term_game_id, term_steam_appid, token):
         candidates = fetch_steamgriddb_candidates(
-            api_key, game_name, limit=24, game_id=game_id, steam_appid=steam_appid
+            api_key, term, limit=24, game_id=term_game_id, steam_appid=term_steam_appid
         )
         items = candidates.get(keys.get(category), [])
 
@@ -2356,10 +2563,23 @@ def show_steamgriddb_picker(obj, category):
                 downloaded = list(pool.map(download_thumb, items))
             results = [d for d in downloaded if d]
 
-        if not closed_state[0]:
-            GLib.idle_add(populate, results)
+        if not closed_state[0] and token == search_token[0]:
+            GLib.idle_add(populate, results, token)
 
-    run_in_background(fetch_candidates)
+    def start_search(term, term_game_id=None, term_steam_appid=None):
+        if closed_state[0] or not term:
+            return
+        search_token[0] += 1
+        token = search_token[0]
+        stack.set_visible_child_name("loading")
+        run_in_background(fetch_candidates, term, term_game_id, term_steam_appid, token)
+
+    def on_search_activate(entry):
+        start_search(entry.get_text().strip())
+
+    search_entry.connect("activate", on_search_activate)
+
+    start_search(game_name, game_id, steam_appid)
 
     dialog.present()
 
