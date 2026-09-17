@@ -8,6 +8,7 @@ import warnings
 import gi
 import vdf
 import signal
+from datetime import datetime
 
 warnings.filterwarnings('ignore', category=DeprecationWarning)
 
@@ -398,12 +399,45 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
     def carrousel_active(self):
         return self.interface_mode == "Carrousel"
 
-    def grid_position_align(self):
-        return {
-            "Top": Gtk.Align.START,
-            "Middle": Gtk.Align.CENTER,
-            "Bottom": Gtk.Align.END,
-        }.get(getattr(self, 'grid_position', 'Middle'), Gtk.Align.CENTER)
+    def grid_position_valign(self):
+        position = getattr(self, 'grid_position', 'Middle')
+        if position.startswith("Top"):
+            return Gtk.Align.START
+        if position.startswith("Bottom"):
+            return Gtk.Align.END
+        return Gtk.Align.CENTER
+
+    def grid_position_halign(self):
+        position = getattr(self, 'grid_position', 'Middle')
+        if position.endswith("Left"):
+            return Gtk.Align.START
+        if position.endswith("Right"):
+            return Gtk.Align.END
+        return Gtk.Align.CENTER
+
+    def wrap_content_with_position(self, content_widget, info_panel):
+        grid_valign = self.grid_position_valign()
+        info_below = grid_valign != Gtk.Align.END
+
+        content_group = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        content_group.set_hexpand(True)
+        if info_panel is not None and not info_below:
+            content_group.append(info_panel)
+        content_group.append(content_widget)
+        if info_panel is not None and info_below:
+            content_group.append(info_panel)
+
+        position_wrapper = Gtk.CenterBox(orientation=Gtk.Orientation.VERTICAL)
+        position_wrapper.set_hexpand(True)
+        position_wrapper.set_vexpand(True)
+        if grid_valign == Gtk.Align.START:
+            position_wrapper.set_start_widget(content_group)
+        elif grid_valign == Gtk.Align.END:
+            position_wrapper.set_end_widget(content_group)
+        else:
+            position_wrapper.set_center_widget(content_group)
+
+        return position_wrapper
 
     def get_named_rgb(self, name, fallback=(30, 30, 34)):
         found, rgba = Gtk.Box().get_style_context().lookup_color(name)
@@ -712,6 +746,31 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
         self.launcher_banner_base_provider = base_provider
         return base_box
 
+    def cache_busted_uri(self, source_path, cache_key):
+        counter_attr = f"_{cache_key}_counter"
+        path_attr = f"_{cache_key}_path"
+
+        cache_path = source_path
+        if os.path.getsize(source_path) > 0:
+            counter = getattr(self, counter_attr, 0) + 1
+            setattr(self, counter_attr, counter)
+            candidate_path = f"{source_path}.cache{counter}"
+            try:
+                shutil.copyfile(source_path, candidate_path)
+                cache_path = candidate_path
+            except OSError:
+                cache_path = source_path
+
+        old_cache_path = getattr(self, path_attr, None)
+        setattr(self, path_attr, cache_path if cache_path != source_path else None)
+        if old_cache_path and old_cache_path != cache_path and os.path.isfile(old_cache_path):
+            try:
+                os.remove(old_cache_path)
+            except OSError:
+                pass
+
+        return Gio.File.new_for_path(cache_path).get_uri()
+
     def update_launcher_banner_css(self):
         base_box = getattr(self, 'launcher_banner_base_box', None)
         base_provider = getattr(self, 'launcher_banner_base_provider', None)
@@ -758,20 +817,7 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
         base_provider.load_from_data(base_css.encode("utf-8"))
 
         if banner_image_box is not None and provider is not None and banner_path is not None and os.path.isfile(banner_path):
-            cache_path = banner_path
-            if os.path.getsize(banner_path) > 0:
-                self._banner_css_cache_counter = getattr(self, '_banner_css_cache_counter', 0) + 1
-                candidate_path = f"{banner_path}.cache{self._banner_css_cache_counter}"
-                try:
-                    shutil.copyfile(banner_path, candidate_path)
-                    cache_path = candidate_path
-                except OSError:
-                    cache_path = banner_path
-
-            old_cache_path = getattr(self, '_banner_css_cache_path', None)
-            self._banner_css_cache_path = cache_path if cache_path != banner_path else None
-
-            banner_uri = Gio.File.new_for_path(cache_path).get_uri()
+            banner_uri = self.cache_busted_uri(banner_path, 'launcher_banner_css_cache')
             banner_css = f"""
             .launcher-screen-banner-image {{
                 background-image: url("{banner_uri}");
@@ -794,12 +840,6 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
                 }}
                 """
                 fade_provider.load_from_data(fade_css.encode("utf-8"))
-
-            if old_cache_path and old_cache_path != cache_path and os.path.isfile(old_cache_path):
-                try:
-                    os.remove(old_cache_path)
-                except OSError:
-                    pass
 
     def apply_background_mode_live(self, new_mode):
         show_banner = self.banner_overlay_enabled()
@@ -856,9 +896,11 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
     def apply_background_update_now(self):
         self.update_launcher_banner_css()
         self.update_background()
+        self.update_info_panel()
 
     def schedule_background_update(self):
         self.update_launcher_banner_css()
+        self.update_info_panel()
 
         if getattr(self, 'stack_banner', None) is None:
             return
@@ -907,7 +949,7 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
                 if show_banner and banner_image_box is not None:
                     candidate = f"{BANNERS_DIR}/{game.gameid}.png"
                     if os.path.isfile(candidate):
-                        banner_uri = Gio.File.new_for_path(candidate).get_uri()
+                        banner_uri = self.cache_busted_uri(candidate, 'background_banner_cache')
 
                         window_r, window_g, window_b = self.get_named_rgb("theme_bg_color")
                         if base_mode == "dominant_color" and color_css:
@@ -1161,17 +1203,6 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
                 return child
         return None
 
-    def on_flowbox_key(self, controller, keyval, keycode, state):
-        direction = {
-            Gdk.KEY_Right: Gtk.DirectionType.RIGHT,
-            Gdk.KEY_Left: Gtk.DirectionType.LEFT,
-            Gdk.KEY_Down: Gtk.DirectionType.DOWN,
-            Gdk.KEY_Up: Gtk.DirectionType.UP,
-        }.get(keyval)
-        if direction is None:
-            return False
-        return navigate_focus(direction)
-
     def on_flowbox_keyval_tracker(self, controller, keyval, keycode, state):
         self._last_flowbox_keyval = keyval
         if self.interface_mode == "List" and keyval in (Gdk.KEY_Left, Gdk.KEY_Right):
@@ -1276,18 +1307,18 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
 
         def update_sort_data():
             self.playtime_data.clear()
+            self.latest_games_order.clear()
             try:
                 data = load_json_file(GAMES_JSON, [])
                 for item in data:
                     if isinstance(item, dict) and "gameid" in item:
                         self.playtime_data[item["gameid"]] = item.get("playtime", 0)
-            except:
-                pass
-
-            self.latest_games_order.clear()
-            try:
-                for idx, gid in enumerate(load_json_file(LATEST_GAMES, default=[])):
-                    self.latest_games_order[gid.strip()] = idx
+                        last_played = item.get("last_played")
+                        if last_played:
+                            try:
+                                self.latest_games_order[item["gameid"]] = -datetime.fromisoformat(last_played).timestamp()
+                            except ValueError:
+                                pass
             except:
                 pass
 
@@ -1492,8 +1523,24 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
         if is_big:
             self.flowbox.set_halign(Gtk.Align.CENTER)
             self.flowbox.set_valign(Gtk.Align.CENTER)
-            self.flowbox.set_min_children_per_line(2)
-            self.flowbox.set_max_children_per_line(20)
+            if self.interface_mode in ("Grid", "Covers"):
+                max_children = getattr(self, 'grid_max_children_per_line', 20)
+                self.flowbox.set_min_children_per_line(min(2, max_children))
+                self.flowbox.set_max_children_per_line(max_children)
+            else:
+                self.flowbox.set_min_children_per_line(2)
+                self.flowbox.set_max_children_per_line(20)
+
+            horizontal_mode = (
+                self.interface_mode in ("Grid", "Covers")
+                and getattr(self, 'grid_orientation', 'Vertical') == 'Horizontal'
+            )
+            if horizontal_mode:
+                self.flowbox.set_orientation(Gtk.Orientation.VERTICAL)
+                scroll_box.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.NEVER)
+            else:
+                self.flowbox.set_orientation(Gtk.Orientation.HORIZONTAL)
+                scroll_box.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         else:
             self.flowbox.set_halign(Gtk.Align.FILL)
             self.flowbox.set_valign(Gtk.Align.START)
@@ -1619,26 +1666,37 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
             self.scale_zoom.set_valign(Gtk.Align.CENTER)
             self.scale_zoom.set_vexpand(False)
 
+            info_panel = None
+            if self.info_enabled and self.interface_mode in ("Grid", "Covers", "Carrousel"):
+                info_panel = self.build_info_panel()
+
             if self.carrousel_active():
                 self.carrousel_box = self.build_carrousel_widget()
-                self.carrousel_box.set_vexpand(True)
-                right_vbox.append(self.carrousel_box)
-            elif self.interface_mode == "Covers":
-                covers_wrapper = Gtk.CenterBox(orientation=Gtk.Orientation.VERTICAL)
-                covers_wrapper.set_vexpand(True)
+                self.carrousel_box.set_vexpand(False)
+                right_vbox.append(self.wrap_content_with_position(self.carrousel_box, info_panel))
+            elif self.interface_mode in ("Covers", "Grid"):
                 scroll_box.set_vexpand(False)
                 scroll_box.set_propagate_natural_height(True)
-                self.flowbox.set_margin_top(40)
-                self.flowbox.set_margin_bottom(40)
-                self.flowbox.set_margin_start(40)
-                self.flowbox.set_margin_end(40)
-                if self.grid_position == "Top":
-                    covers_wrapper.set_start_widget(scroll_box)
-                elif self.grid_position == "Bottom":
-                    covers_wrapper.set_end_widget(scroll_box)
+
+                position_halign = self.grid_position_halign()
+                self.flowbox.set_halign(Gtk.Align.CENTER)
+                if horizontal_mode or position_halign != Gtk.Align.CENTER:
+                    self.flowbox.set_hexpand(False)
+                    scroll_box.set_hexpand(False)
+                    scroll_box.set_halign(position_halign)
+                    scroll_box.set_propagate_natural_width(True)
                 else:
-                    covers_wrapper.set_center_widget(scroll_box)
-                right_vbox.append(covers_wrapper)
+                    self.flowbox.set_hexpand(True)
+                    scroll_box.set_hexpand(True)
+                    scroll_box.set_halign(Gtk.Align.FILL)
+                    scroll_box.set_propagate_natural_width(False)
+                if self.interface_mode == "Covers":
+                    self.flowbox.set_margin_top(40)
+                    self.flowbox.set_margin_bottom(40)
+                    self.flowbox.set_margin_start(40)
+                    self.flowbox.set_margin_end(40)
+
+                right_vbox.append(self.wrap_content_with_position(scroll_box, info_panel))
             else:
                 right_vbox.append(scroll_box)
                 scroll_box.set_vexpand(True)
@@ -1970,6 +2028,14 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
         fit = int((width / self.carrousel_step - 1) / 2)
         return max(1, min(max_radius, fit))
 
+    def carrousel_fan_center(self, extent, align):
+        if align == Gtk.Align.CENTER:
+            return extent / 2
+        margin = min(extent / 2, self.carrousel_radius * self.carrousel_step + self.carrousel_step / 2)
+        if align == Gtk.Align.START:
+            return margin
+        return extent - margin
+
     def place_carrousel_slot_base(self, slot):
         _, natural_w, _, _ = slot["box"].measure(Gtk.Orientation.HORIZONTAL, -1)
         _, natural_h, _, _ = slot["box"].measure(Gtk.Orientation.VERTICAL, natural_w)
@@ -1977,12 +2043,34 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
         base_y = self.carrousel_center_y - natural_h / 2
         self.carrousel_fixed.move(slot["box"], base_x, base_y)
 
-    def update_carrousel_layout(self, width):
-        if not width or not self.carrousel_step or not getattr(self, 'carrousel_slots', None):
+    def carrousel_layout_extent(self):
+        fixed = getattr(self, 'carrousel_fixed', None)
+        if fixed is not None:
+            allocated = fixed.get_width()
+            if allocated:
+                return allocated
+        return self.get_width() or 0
+
+    def update_carrousel_layout(self, *_args):
+        if not self.carrousel_step or not getattr(self, 'carrousel_slots', None):
             return
-        self.carrousel_center_x = width / 2
+        if getattr(self, '_carrousel_layout_tick_id', None) is not None:
+            return
+
+        def do_layout(_widget, _frame_clock):
+            self._carrousel_layout_tick_id = None
+            self.apply_carrousel_layout()
+            return GLib.SOURCE_REMOVE
+
+        self._carrousel_layout_tick_id = self.add_tick_callback(do_layout)
+
+    def apply_carrousel_layout(self):
+        if not self.carrousel_step or not getattr(self, 'carrousel_slots', None):
+            return
+        extent = self.carrousel_layout_extent() or self.carrousel_step * 3
         n = len(self.carrousel_visible_games())
-        self.carrousel_radius = self.carrousel_fit_radius(n, width)
+        self.carrousel_radius = self.carrousel_fit_radius(n, extent)
+        self.carrousel_center_x = self.carrousel_fan_center(extent, self.grid_position_halign())
         for slot in self.carrousel_slots:
             self.place_carrousel_slot_base(slot)
             self.layout_carrousel_slot(slot, slot.get("visual_offset", slot["offset"]))
@@ -1997,7 +2085,7 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
         d = abs(offset)
         if d > radius:
             opacity *= max(0.0, radius + 1 - d)
-        translate_x = offset * self.carrousel_step
+        translate_x, translate_y = offset * self.carrousel_step, 0
         slot["box"].set_opacity(opacity)
 
         can_target = abs(offset) <= radius + 0.5
@@ -2024,7 +2112,7 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
         css = (
             f"entry.flowbox-entry.cover-container.carrousel-cover-box {{ "
             f"transition: {transition}; "
-            f"transform: translate({translate_x:.2f}px, 0) scale({scale:.4f}); "
+            f"transform: translate({translate_x:.2f}px, {translate_y:.2f}px) scale({scale:.4f}); "
             f"box-shadow: {box_shadow}; }}"
         )
         slot["style_provider"].load_from_data(css.encode("utf-8"))
@@ -2036,7 +2124,7 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
         outer.set_can_focus(True)
         outer.set_focusable(True)
         outer.set_halign(Gtk.Align.FILL)
-        outer.set_valign(self.grid_position_align())
+        outer.set_valign(self.grid_position_valign())
         outer.set_hexpand(True)
         outer.set_overflow(Gtk.Overflow.HIDDEN)
 
@@ -2075,7 +2163,8 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
     def connect_carrousel_resize(self):
         surface = self.get_surface()
         if surface is not None:
-            surface.connect("notify::width", lambda s, p: self.update_carrousel_layout(s.get_width()))
+            surface.connect("notify::width", lambda s, p: self.update_carrousel_layout())
+            surface.connect("notify::height", lambda s, p: self.update_carrousel_layout())
         else:
             self.connect("realize", lambda w: self.connect_carrousel_resize())
 
@@ -2088,17 +2177,18 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
             self._carrousel_anim_id = None
 
         max_width, max_height = self.carrousel_slot_size()
-        self.carrousel_step = max_width + 20
         glow_margin = 70
-        total_height = max_height + 50 + glow_margin * 2
-        self.carrousel_fixed.set_size_request(self.carrousel_step * 3, total_height)
-        current_width = self.get_width() or self.carrousel_step * 3
-        self.carrousel_center_x = current_width / 2
-        self.carrousel_center_y = total_height / 2
+        self.carrousel_step = max_width + 20
+        cross_size = max_height + 50 + glow_margin * 2
+        self.carrousel_fixed.set_size_request(self.carrousel_step * 3, cross_size)
+
+        extent = self.carrousel_layout_extent() or self.carrousel_step * 3
 
         games = self.carrousel_visible_games()
         n = len(games)
-        self.carrousel_radius = self.carrousel_fit_radius(n, current_width)
+        self.carrousel_radius = self.carrousel_fit_radius(n, extent)
+        self.carrousel_center_x = self.carrousel_fan_center(extent, self.grid_position_halign())
+        self.carrousel_center_y = cross_size / 2
 
         if n == 0:
             for slot in self.carrousel_slots:
@@ -2138,7 +2228,7 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
                 slot.pop("_settle_offset", None)
                 self.layout_carrousel_slot(slot, slot["offset"])
 
-        self.carrousel_radius = self.carrousel_fit_radius(n, self.get_width())
+        self.carrousel_radius = self.carrousel_fit_radius(n, self.carrousel_layout_extent())
         self.carrousel_index = (self.carrousel_index + delta) % n
 
         span = self.carrousel_max_offset - self.carrousel_min_offset + 1
@@ -2756,21 +2846,43 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
         label_menu_title.set_margin_bottom(4)
 
         formatted = None
+        last_played_text = None
+        last_played_exact = None
+        data = load_json_file(GAMES_JSON, [])
+        for item_data in data:
+            if isinstance(item_data, dict) and item_data.get("gameid") == game.gameid:
+                last_played_iso = item_data.get("last_played")
+                last_played_text = self.format_last_played(last_played_iso)
+                if last_played_iso:
+                    try:
+                        last_played_exact = datetime.fromisoformat(last_played_iso).strftime("%Y-%m-%d %H:%M")
+                    except ValueError:
+                        pass
+                if game.runner != "Steam":
+                    game.playtime = item_data.get("playtime", 0)
+                break
+
         if game.runner == "Steam":
             steam_minutes = get_steam_app_playtime_minutes(game.path, game.steam_user)
             formatted = self.format_playtime(steam_minutes * 60)
         else:
-            data = load_json_file(GAMES_JSON, [])
-            for item_data in data:
-                if isinstance(item_data, dict) and item_data.get("gameid") == game.gameid:
-                    game.playtime = item_data.get("playtime", 0)
-                    formatted = self.format_playtime(game.playtime)
-                    break
+            formatted = self.format_playtime(game.playtime)
 
-        label_menu_playtime = Gtk.Label(label=formatted or "")
+        label_menu_playtime = Gtk.Label(label=_("Playtime: {}").format(formatted) if formatted else "")
         label_menu_playtime.set_halign(Gtk.Align.START)
         label_menu_playtime.set_margin_bottom(4)
         label_menu_playtime.set_visible(bool(formatted))
+
+        never_played = not formatted and not last_played_text
+        label_menu_last_played = Gtk.Label(
+            label=_("Last played: {}").format(last_played_text) if last_played_text
+            else (_("Never played") if never_played else "")
+        )
+        label_menu_last_played.set_halign(Gtk.Align.START)
+        label_menu_last_played.set_margin_bottom(4)
+        label_menu_last_played.set_visible(bool(last_played_text) or never_played)
+        if last_played_exact:
+            label_menu_last_played.set_tooltip_text(last_played_exact)
 
         header_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         header_box.set_margin_start(6)
@@ -2778,6 +2890,7 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
         header_box.set_margin_top(6)
         header_box.append(label_menu_title)
         header_box.append(label_menu_playtime)
+        header_box.append(label_menu_last_played)
 
         self.proton_log = f"{LOGS_DIR}/{game.gameid}/proton.log"
         self.umu_log = f"{LOGS_DIR}/{game.gameid}/umu.log"
@@ -3020,22 +3133,214 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
         if hours == 0 and minutes == 0:
             return None
 
-        txt_hour   = _("hour")
-        txt_hours  = _("hours")
-        txt_minute = _("minute")
-        txt_minutes = _("minutes")
-
         parts = []
 
         if hours > 0:
-            word = txt_hour if hours == 1 else txt_hours
-            parts.append(f"{hours} {word}")
+            parts.append((_("{} hour") if hours == 1 else _("{} hours")).format(hours))
 
         if minutes > 0:
-            word = txt_minute if minutes == 1 else txt_minutes
-            parts.append(f"{minutes} {word}")
+            parts.append((_("{} minute") if minutes == 1 else _("{} minutes")).format(minutes))
 
         return " ".join(parts)
+
+    def format_last_played(self, last_played_iso):
+        if not last_played_iso:
+            return None
+
+        try:
+            played_at = datetime.fromisoformat(last_played_iso)
+        except ValueError:
+            return None
+
+        seconds = (datetime.now() - played_at).total_seconds()
+        if seconds < 60:
+            return _("Just now")
+
+        minutes = int(seconds // 60)
+        if minutes < 60:
+            if minutes == 1:
+                return _("A minute ago")
+            return _("{} minutes ago").format(minutes)
+
+        hours = int(seconds // 3600)
+        if hours < 24:
+            if hours == 1:
+                return _("An hour ago")
+            return _("{} hours ago").format(hours)
+
+        days = int(seconds // 86400)
+        if days < 7:
+            if days == 1:
+                return _("Yesterday")
+            return _("{} days ago").format(days)
+
+        weeks = int(days // 7)
+        if weeks < 4:
+            if weeks == 1:
+                return _("A week ago")
+            return _("{} weeks ago").format(weeks)
+
+        months = int(days // 30)
+        if months < 12:
+            if months == 1:
+                return _("A month ago")
+            return _("{} months ago").format(months)
+
+        years = int(days // 365)
+        if years == 1:
+            return _("A year ago")
+        return _("{} years ago").format(years)
+
+    def build_info_panel(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        box.set_margin_top(20)
+        box.set_margin_bottom(10)
+        box.set_margin_start(30)
+        box.set_margin_end(30)
+        box.set_halign(Gtk.Align.CENTER)
+
+        self.label_info_title = Gtk.Label()
+        self.label_info_title.add_css_class("info-panel-title")
+        self.label_info_title.set_halign(Gtk.Align.CENTER)
+        self.label_info_title.set_ellipsize(Pango.EllipsizeMode.END)
+        box.append(self.label_info_title)
+
+        separator = Gtk.Box()
+        separator.add_css_class("info-panel-separator")
+        separator.set_hexpand(True)
+        box.append(separator)
+
+        stats_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
+        stats_row.set_halign(Gtk.Align.CENTER)
+
+        self.label_info_playtime = Gtk.Label()
+        self.label_info_playtime.add_css_class("info-panel-stat")
+        stats_row.append(self.label_info_playtime)
+
+        self.label_info_sep1 = Gtk.Label(label="•")
+        self.label_info_sep1.add_css_class("info-panel-stat")
+        stats_row.append(self.label_info_sep1)
+
+        self.label_info_categories = Gtk.Label()
+        self.label_info_categories.add_css_class("info-panel-stat")
+        stats_row.append(self.label_info_categories)
+
+        self.label_info_sep2 = Gtk.Label(label="•")
+        self.label_info_sep2.add_css_class("info-panel-stat")
+        stats_row.append(self.label_info_sep2)
+
+        self.label_info_last_played = Gtk.Label()
+        self.label_info_last_played.add_css_class("info-panel-stat")
+        stats_row.append(self.label_info_last_played)
+
+        box.append(stats_row)
+
+        self.info_panel = box
+        self.connect_info_panel_resize()
+        self.apply_info_panel_width()
+        self.update_info_panel()
+        return box
+
+    def connect_info_panel_resize(self):
+        surface = self.get_surface()
+        if surface is not None:
+            surface.connect("notify::width", lambda s, p: self.update_info_panel_width())
+            surface.connect("notify::height", lambda s, p: self.update_info_panel_width())
+        else:
+            self.connect("realize", lambda w: self.connect_info_panel_resize())
+
+    def update_info_panel_width(self):
+        if getattr(self, '_info_width_tick_id', None) is not None:
+            return
+
+        def do_resize(_widget, _frame_clock):
+            self._info_width_tick_id = None
+            self.apply_info_panel_width()
+            return GLib.SOURCE_REMOVE
+
+        self._info_width_tick_id = self.add_tick_callback(do_resize)
+
+    def apply_info_panel_width(self):
+        panel = getattr(self, 'info_panel', None)
+        if panel is None:
+            return
+        width = self.get_width() or self.window_width
+        panel.set_size_request(min(1200, max(240, width - 80)), -1)
+
+        title_size = 56
+        stat_size = 22
+        accent_r, accent_g, accent_b = self.get_accent_rgb()
+        accent_rgb = f"rgb({accent_r}, {accent_g}, {accent_b})"
+        accent_transparent = f"rgba({accent_r}, {accent_g}, {accent_b}, 0)"
+        add_css_once("info_panel", f"""
+            .info-panel-title {{
+                font-size: {title_size}px;
+                font-weight: bold;
+                color: {accent_rgb};
+                text-shadow: 0 2px 4px alpha(black, 0.6);
+            }}
+            .info-panel-separator {{
+                margin-top: 20px;
+                margin-bottom: 20px;
+                min-height: 3px;
+                background-image: linear-gradient(to right,
+                    {accent_transparent},
+                    {accent_rgb} 25%,
+                    {accent_rgb} 75%,
+                    {accent_transparent}
+                );
+            }}
+            .info-panel-stat {{
+                font-size: {stat_size}px;
+                color: {accent_rgb};
+                text-shadow: 0 1px 3px alpha(black, 0.6);
+            }}
+        """)
+
+    def update_info_panel(self):
+        panel = getattr(self, 'info_panel', None)
+        if panel is None:
+            return
+
+        game = self.selected() if getattr(self, 'info_enabled', False) else None
+        if not game:
+            panel.set_visible(False)
+            return
+
+        panel.set_visible(True)
+        self.label_info_title.set_text(game.title)
+
+        if game.runner == "Steam":
+            steam_minutes = get_steam_app_playtime_minutes(game.path, game.steam_user)
+            formatted_playtime = self.format_playtime(steam_minutes * 60)
+        else:
+            formatted_playtime = self.format_playtime(game.playtime)
+        playtime_visible = bool(formatted_playtime)
+        self.label_info_playtime.set_text(
+            _("Playtime: {}").format(formatted_playtime) if formatted_playtime else ""
+        )
+        self.label_info_playtime.set_visible(playtime_visible)
+
+        categories = game.category if isinstance(game.category, list) else ([game.category] if game.category else [])
+        categories_visible = bool(categories)
+        self.label_info_categories.set_text(", ".join(categories) if categories else "")
+        self.label_info_categories.set_visible(categories_visible)
+
+        last_played_text = self.format_last_played(game.last_played)
+        last_played_visible = bool(last_played_text)
+        self.label_info_last_played.set_text(
+            _("Last played: {}").format(last_played_text) if last_played_text else ""
+        )
+        self.label_info_last_played.set_visible(last_played_visible)
+        if game.last_played:
+            self.label_info_last_played.set_tooltip_text(
+                datetime.fromisoformat(game.last_played).strftime("%Y-%m-%d %H:%M")
+            )
+        else:
+            self.label_info_last_played.set_tooltip_text(None)
+
+        self.label_info_sep1.set_visible(playtime_visible and categories_visible)
+        self.label_info_sep2.set_visible((playtime_visible or categories_visible) and last_played_visible)
 
     def on_context_menu_play(self, action, param):
         self.context_menu.popdown()
@@ -3546,6 +3851,10 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
         self.window_height = int(cfg.config.get('height', 720))
         self.cover_size = int(cfg.config.get('cover-size', 100))
         self.grid_position = cfg.config.get('grid-position', 'Middle').strip('"')
+        self.grid_orientation = cfg.config.get('grid-orientation', 'Vertical').strip('"')
+        grid_max_children_enabled = cfg.config.get('grid-max-children-enabled', 'False') == 'True'
+        self.grid_max_children_per_line = int(cfg.config.get('grid-max-children-per-line', 20)) if grid_max_children_enabled else 20
+        self.info_enabled = cfg.config.get('info-enabled', 'False') == 'True'
         self.sort = cfg.config.get('sort', '')
         self.category = cfg.config.get('category', '')
         self.steam_user = cfg.config.get('steam-user', 'all')
@@ -3929,6 +4238,7 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
                     settings_dialog.accent_color,
                     settings_dialog.combobox_theme_engine.get_active_id(),
                 )
+                self.apply_info_panel_width()
 
                 self.save_interface_settings()
                 settings_dialog.update_config_file()
@@ -3970,6 +4280,17 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
                     os.execv(sys.executable, [sys.executable, '-m', 'faugus.launcher'] + sys.argv[1:])
 
                 if self.grid_position != settings_dialog.combobox_grid_position.get_active_id():
+                    os.execv(sys.executable, [sys.executable, '-m', 'faugus.launcher'] + sys.argv[1:])
+
+                if self.grid_orientation != settings_dialog.combobox_grid_orientation.get_active_id():
+                    os.execv(sys.executable, [sys.executable, '-m', 'faugus.launcher'] + sys.argv[1:])
+
+                new_grid_max_children_enabled = settings_dialog.checkbox_grid_max_children.get_active()
+                new_grid_max_children = int(settings_dialog.entry_grid_max_children.get_value()) if new_grid_max_children_enabled else 20
+                if self.grid_max_children_per_line != new_grid_max_children:
+                    os.execv(sys.executable, [sys.executable, '-m', 'faugus.launcher'] + sys.argv[1:])
+
+                if self.info_enabled != settings_dialog.checkbox_info.get_active():
                     os.execv(sys.executable, [sys.executable, '-m', 'faugus.launcher'] + sys.argv[1:])
 
                 if self.language != settings_dialog.combobox_language.get_active_id():
@@ -4114,22 +4435,9 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
         game_directory = os.path.dirname(expand_path(game.path))
         cwd = game_directory if game_directory and os.path.isdir(game_directory) else None
 
-        def update_latest_and_sort():
-            self.update_latest_games_file(game.gameid)
-            if hasattr(self, 'current_sort') and self.current_sort == self.opt_lastplayed:
-                self.latest_games_order.clear()
-                try:
-                    for idx, gid in enumerate(load_json_file(LATEST_GAMES, default=[])):
-                        self.latest_games_order[gid.strip()] = idx
-                except:
-                    pass
-                if hasattr(self, 'flowbox'):
-                    self.flowbox.invalidate_sort()
-                if self.carrousel_active() and getattr(self, 'carrousel_slots', None):
-                    self.carrousel_resync_after_reorder(game.gameid)
-
         if game.runner == "Steam":
-            update_latest_and_sort()
+            self.update_last_played(gameid)
+            self.sync_last_played_order(gameid)
             subprocess.Popen(
                 [sys.executable, "-m", "faugus.runner", "--game", gameid],
                 cwd=cwd,
@@ -4153,7 +4461,9 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
             self.update_icon()
             return
 
-        update_latest_and_sort()
+        self.update_last_played(gameid)
+        self.sync_last_played_order(gameid)
+
         cmd = (sys.executable, "-m", "faugus.runner", "--game", gameid)
         proc = subprocess.Popen(cmd, cwd=cwd if cwd else None, env=subprocess_env())
 
@@ -4175,6 +4485,9 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
         self.processes.pop(game, None)
         self.save_running()
 
+        self.reload_playtimes()
+        self.sync_last_played_order(game)
+
         if hasattr(self, 'current_sort') and hasattr(self, 'opt_playtime') and self.current_sort == self.opt_playtime:
             try:
                 data = load_json_file(GAMES_JSON, [])
@@ -4188,17 +4501,48 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
                 GLib.idle_add(self.flowbox.invalidate_sort)
 
         GLib.idle_add(self.update_icon)
+        GLib.idle_add(self.update_info_panel)
 
-    def update_latest_games_file(self, gameid):
-        games = load_json_file(LATEST_GAMES, default=[])
+    def update_last_played(self, gameid):
+        games = load_json_file(GAMES_JSON, default=[])
 
-        valid_ids = {g.gameid for g in self.games}
+        timestamp = datetime.now().isoformat()
+        for entry in games:
+            if isinstance(entry, dict) and entry.get("gameid") == gameid:
+                entry["last_played"] = timestamp
+                break
 
-        games = [g for g in games if g in valid_ids and g != gameid]
-        games.insert(0, gameid)
-
-        save_json_file(games, LATEST_GAMES)
+        save_json_file(games, GAMES_JSON)
         self.notify_tray_menu_changed()
+
+        for game in self.games:
+            if game.gameid == gameid:
+                game.last_played = timestamp
+                break
+        self.update_info_panel()
+
+    def sync_last_played_order(self, gameid):
+        if not (hasattr(self, 'current_sort') and self.current_sort == self.opt_lastplayed):
+            return
+
+        self.latest_games_order.clear()
+        try:
+            for item in load_json_file(GAMES_JSON, default=[]):
+                if not isinstance(item, dict) or "gameid" not in item:
+                    continue
+                last_played = item.get("last_played")
+                if last_played:
+                    try:
+                        self.latest_games_order[item["gameid"]] = -datetime.fromisoformat(last_played).timestamp()
+                    except ValueError:
+                        pass
+        except:
+            pass
+
+        if hasattr(self, 'flowbox'):
+            self.flowbox.invalidate_sort()
+        if self.carrousel_active() and getattr(self, 'carrousel_slots', None):
+            self.carrousel_resync_after_reorder(gameid)
 
     def on_button_kill_clicked(self, widget):
         for gameid, pid in list(self.running.items()):
@@ -4462,11 +4806,13 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
         if not games_data:
             return
 
-        playtime_map = {g["gameid"]: g.get("playtime", 0) for g in games_data}
+        data_map = {g["gameid"]: g for g in games_data if isinstance(g, dict) and "gameid" in g}
 
         for game in self.games:
-            if game.gameid in playtime_map:
-                game.playtime = playtime_map[game.gameid]
+            entry = data_map.get(game.gameid)
+            if entry:
+                game.playtime = entry.get("playtime", 0)
+                game.last_played = entry.get("last_played", game.last_played)
 
     def remove_steam_shortcut(self, title):
         for path in get_all_shortcut_paths(self.steam_user):
@@ -4493,22 +4839,12 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
                     pass
 
     def remove_latest_and_order(self, gameid):
-        try:
-            recent_games = load_json_file(LATEST_GAMES, default=[])
-
-            if gameid in recent_games:
-                recent_games.remove(gameid)
-
-                save_json_file(recent_games, LATEST_GAMES)
-                self.notify_tray_menu_changed()
-
-        except FileNotFoundError:
-            pass
-
         custom_order_data = load_json_file(CUSTOM_ORDER, default={})
         if gameid in custom_order_data:
             del custom_order_data[gameid]
             save_json_file(custom_order_data, CUSTOM_ORDER)
+
+        self.notify_tray_menu_changed()
 
     def show_warning_dialog_main(self, parent, text1, text2, callback=None):
         show_message_dialog(text1, text2, parent=parent, callback=callback)
@@ -5073,6 +5409,8 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
                 edited_child.label.set_text(game.title)
                 self.update_game_visual(edited_child)
 
+            self.flowbox.invalidate_sort()
+
             self.select_game_by_title(game.title)
             self.launcher_banner_dominant_rgb = None
             self.apply_background_update_now()
@@ -5515,14 +5853,14 @@ class Settings(Gtk.Dialog):
         self.combobox_theme.append("system", _("Default"))
         self.combobox_theme.append("light", _("Light"))
         self.combobox_theme.append("dark", _("Dark"))
-        self.combobox_theme.connect("changed", self.on_theme_accent_changed)
+        self._combobox_theme_handler = self.combobox_theme.connect("changed", self.on_theme_accent_changed)
 
         self.label_accent = Gtk.Label(label=_("Accent Color"))
         self.label_accent.set_halign(Gtk.Align.START)
         self.combobox_accent = IdComboBox()
         self.combobox_accent.append("system", _("Default"))
         self.combobox_accent.append("custom", _("Custom"))
-        self.combobox_accent.connect("changed", self.on_theme_accent_changed)
+        self._combobox_accent_handler = self.combobox_accent.connect("changed", self.on_theme_accent_changed)
 
         self.color_button = Gtk.ColorButton()
         self.color_button.set_sensitive(False)
@@ -5554,6 +5892,36 @@ class Settings(Gtk.Dialog):
         self.combobox_grid_position.append("Top", _("Top"))
         self.combobox_grid_position.append("Middle", _("Middle"))
         self.combobox_grid_position.append("Bottom", _("Bottom"))
+
+        self.label_grid_orientation = Gtk.Label(label=_("Orientation"))
+        self.label_grid_orientation.set_halign(Gtk.Align.START)
+        self.combobox_grid_orientation = IdComboBox()
+        self.combobox_grid_orientation.append("Vertical", _("Vertical"))
+        self.combobox_grid_orientation.append("Horizontal", _("Horizontal"))
+
+        self.checkbox_grid_max_children = Gtk.CheckButton(label=_("Maximum Columns"))
+        self.checkbox_grid_max_children.set_active(False)
+
+        adjustment_grid_max_children = Gtk.Adjustment(
+            value=getattr(self.parent, 'grid_max_children_per_line', 20),
+            lower=1, upper=50, step_increment=1, page_increment=5, page_size=0
+        )
+        self.entry_grid_max_children = Gtk.SpinButton(adjustment=adjustment_grid_max_children, climb_rate=1, digits=0)
+        self.entry_grid_max_children.set_hexpand(True)
+        self.entry_grid_max_children.set_sensitive(False)
+
+        def on_checkbox_grid_max_children_toggled(checkbox):
+            self.entry_grid_max_children.set_sensitive(checkbox.get_active())
+
+        self.checkbox_grid_max_children.connect("toggled", on_checkbox_grid_max_children_toggled)
+
+        def on_grid_orientation_changed(combobox):
+            if combobox.get_active_id() == "Horizontal":
+                self.checkbox_grid_max_children.set_label(_("Maximum Rows"))
+            else:
+                self.checkbox_grid_max_children.set_label(_("Maximum Columns"))
+
+        self.combobox_grid_orientation.connect("changed", on_grid_orientation_changed)
 
         self.checkbox_steamgriddb = Gtk.CheckButton(label=_("SteamGridDB"))
         self.checkbox_steamgriddb.set_active(False)
@@ -5597,6 +5965,9 @@ class Settings(Gtk.Dialog):
         self.label_miscellaneous = Gtk.Label(label=_("Miscellaneous"))
         self.label_miscellaneous.set_halign(Gtk.Align.START)
 
+        self.label_display = Gtk.Label(label=_("Display"))
+        self.label_display.set_halign(Gtk.Align.START)
+
         self.checkbox_discrete_gpu = Gtk.CheckButton(label=_("Discrete GPU"))
 
         self.checkbox_auto_close_on_launch = Gtk.CheckButton(label=_("Auto-close on launch"))
@@ -5635,6 +6006,8 @@ class Settings(Gtk.Dialog):
 
         self.checkbox_hidden_games = Gtk.CheckButton(label=_("Hidden games"))
         self.checkbox_hidden_games.set_tooltip_text(_("Ctrl+H toggles hidden games"))
+
+        self.checkbox_info = Gtk.CheckButton(label=_("Info"))
 
         self.checkbox_gamepad_navigation = Gtk.CheckButton(label=_("Gamepad navigation"))
         self.checkbox_gamepad_navigation.set_active(False)
@@ -5741,27 +6114,30 @@ class Settings(Gtk.Dialog):
 
         label_version = Gtk.Label()
         label_version.set_markup(
-            '<a href="https://github.com/Faugus/faugus-launcher/releases/tag/{0}">{0}</a>'.format(VERSION)
+            '<a href="https://github.com/Faugus/faugus-launcher/releases/tag/{0}">Faugus {0}</a>'.format(VERSION)
         )
         label_version.set_use_markup(True)
-        label_version.set_halign(Gtk.Align.END)
-        label_version.set_valign(Gtk.Align.START)
-        label_version.set_margin_end(10)
-        label_version.set_margin_top(10)
+        label_version.set_halign(Gtk.Align.START)
 
-        box_main = Gtk.Grid()
-        box_main.set_column_homogeneous(True)
-        box_main.set_column_spacing(10)
-        box_left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        box_mid = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        box_right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        grid_page_general = Gtk.Grid()
+        grid_page_general.set_column_homogeneous(True)
+        grid_page_general.set_column_spacing(10)
+        grid_page_interface = Gtk.Grid()
+        grid_page_interface.set_column_homogeneous(True)
+        grid_page_interface.set_column_spacing(10)
+
+        box_general_col1 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        box_general_col2 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        box_general_col3 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+
+        box_interface_col1 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        box_interface_col2 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        box_interface_col3 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
 
         box_buttons = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         box_buttons.set_valign(Gtk.Align.CENTER)
 
         grid_language = build_grid()
-        grid_language.set_vexpand(True)
-        grid_language.set_valign(Gtk.Align.END)
 
         grid_prefix = build_grid()
 
@@ -5771,13 +6147,21 @@ class Settings(Gtk.Dialog):
 
         grid_logs = build_grid()
 
+        grid_version = build_grid()
+        grid_version.set_vexpand(True)
+        grid_version.set_valign(Gtk.Align.END)
+
         grid_miscellaneous = build_grid()
 
         grid_envar = build_grid()
 
-        grid_theme_accent = build_grid()
+        grid_interface_mode = build_grid()
 
-        grid_theme_rest = build_grid(margin_top=False)
+        grid_steamgriddb = build_grid(margin_top=False)
+
+        grid_theme_colors = build_grid()
+
+        grid_interface_checkboxes = build_grid()
 
         grid_support = build_grid(column_homogeneous=True)
         grid_support.set_vexpand(True)
@@ -5820,46 +6204,50 @@ class Settings(Gtk.Dialog):
         grid_logs.attach(self.button_clearlogs, 0, 1, 1, 1)
         self.button_clearlogs.set_hexpand(True)
 
+        grid_version.attach(label_version, 0, 0, 1, 1)
+
         grid_miscellaneous.attach(self.label_miscellaneous, 0, 0, 1, 1)
         grid_miscellaneous.attach(self.checkbox_discrete_gpu, 0, 1, 1, 1)
         grid_miscellaneous.attach(self.checkbox_splash_window, 0, 2, 1, 1)
         grid_miscellaneous.attach(self.checkbox_automatic_updates, 0, 3, 1, 1)
         grid_miscellaneous.attach(self.checkbox_auto_close_on_launch, 0, 4, 1, 1)
-        grid_miscellaneous.attach(self.checkbox_hidden_games, 0, 5, 1, 1)
-        grid_miscellaneous.attach(self.checkbox_gamepad_navigation, 0, 6, 1, 1)
-        grid_miscellaneous.attach(self.checkbox_autostart, 0, 7, 1, 1)
-        grid_miscellaneous.attach(self.checkbox_system_tray, 0, 8, 1, 1)
-        grid_miscellaneous.attach(self.checkbox_minimized_startup, 0, 9, 1, 1)
-        grid_miscellaneous.attach(self.checkbox_mono_icon, 0, 10, 1, 1)
-        grid_miscellaneous.attach(self.checkbox_auto_create_shortcuts, 0, 11, 1, 1)
-        grid_miscellaneous.attach(self.checkbox_wayland_driver, 0, 12, 1, 1)
-        grid_miscellaneous.attach(self.checkbox_wow64, 0, 13, 1, 1)
+        grid_miscellaneous.attach(self.checkbox_gamepad_navigation, 0, 5, 1, 1)
+        grid_miscellaneous.attach(self.checkbox_autostart, 0, 6, 1, 1)
+        grid_miscellaneous.attach(self.checkbox_system_tray, 0, 7, 1, 1)
+        grid_miscellaneous.attach(self.checkbox_minimized_startup, 0, 8, 1, 1)
+        grid_miscellaneous.attach(self.checkbox_mono_icon, 0, 9, 1, 1)
+        grid_miscellaneous.attach(self.checkbox_auto_create_shortcuts, 0, 10, 1, 1)
+        grid_miscellaneous.attach(self.checkbox_wayland_driver, 0, 11, 1, 1)
+        grid_miscellaneous.attach(self.checkbox_wow64, 0, 12, 1, 1)
 
-        grid_theme_accent.attach(self.label_interface, 0, 0, 1, 1)
-        grid_theme_accent.attach(self.combobox_interface, 0, 1, 1, 1)
+        grid_interface_mode.attach(self.label_interface, 0, 0, 1, 1)
+        grid_interface_mode.attach(self.combobox_interface, 0, 1, 1, 1)
         self.combobox_interface.set_hexpand(True)
 
-        grid_theme_rest.attach(self.label_theme_engine, 0, 0, 2, 1)
-        grid_theme_rest.attach(self.combobox_theme_engine, 0, 1, 2, 1)
+        grid_theme_colors.attach(self.label_theme_engine, 0, 0, 2, 1)
+        grid_theme_colors.attach(self.combobox_theme_engine, 0, 1, 2, 1)
         self.combobox_theme_engine.set_hexpand(True)
 
-        grid_theme_rest.attach(self.label_theme, 0, 2, 2, 1)
-        grid_theme_rest.attach(self.combobox_theme, 0, 3, 2, 1)
+        grid_theme_colors.attach(self.label_theme, 0, 2, 2, 1)
+        grid_theme_colors.attach(self.combobox_theme, 0, 3, 2, 1)
         self.combobox_theme.set_hexpand(True)
-        grid_theme_rest.attach(self.label_accent, 0, 4, 2, 1)
-        grid_theme_rest.attach(self.box_accent, 0, 5, 2, 1)
+        grid_theme_colors.attach(self.label_accent, 0, 4, 2, 1)
+        grid_theme_colors.attach(self.box_accent, 0, 5, 2, 1)
         self.combobox_accent.set_hexpand(True)
 
-        grid_theme_rest.attach(self.label_background, 0, 6, 2, 1)
-        grid_theme_rest.attach(self.combobox_background, 0, 7, 2, 1)
+        grid_theme_colors.attach(self.label_background, 0, 6, 2, 1)
+        grid_theme_colors.attach(self.combobox_background, 0, 7, 2, 1)
         self.combobox_background.set_hexpand(True)
 
-        grid_theme_rest.attach(self.checkbox_labels, 0, 8, 1, 1)
-        grid_theme_rest.attach(self.checkbox_zoom, 1, 8, 1, 1)
-        grid_theme_rest.attach(self.checkbox_sort, 0, 9, 1, 1)
-        grid_theme_rest.attach(self.checkbox_categories, 1, 9, 1, 1)
-        grid_theme_rest.attach(self.checkbox_banner, 0, 10, 1, 1)
-        grid_theme_rest.attach(self.checkbox_header_bar, 1, 10, 1, 1)
+        grid_interface_checkboxes.attach(self.label_display, 0, 0, 1, 1)
+        grid_interface_checkboxes.attach(self.checkbox_labels, 0, 1, 1, 1)
+        grid_interface_checkboxes.attach(self.checkbox_zoom, 0, 2, 1, 1)
+        grid_interface_checkboxes.attach(self.checkbox_sort, 0, 3, 1, 1)
+        grid_interface_checkboxes.attach(self.checkbox_categories, 0, 4, 1, 1)
+        grid_interface_checkboxes.attach(self.checkbox_banner, 0, 5, 1, 1)
+        grid_interface_checkboxes.attach(self.checkbox_info, 0, 6, 1, 1)
+        grid_interface_checkboxes.attach(self.checkbox_header_bar, 0, 7, 1, 1)
+        grid_interface_checkboxes.attach(self.checkbox_hidden_games, 0, 8, 1, 1)
 
         grid_envar.attach(self.label_envar, 0, 0, 1, 1)
         grid_envar.attach(scrolled_window, 0, 1, 1, 1)
@@ -5869,48 +6257,116 @@ class Settings(Gtk.Dialog):
         grid_backup.attach(button_backup, 0, 1, 1, 1)
         grid_backup.attach(button_restore, 1, 1, 1, 1)
 
-        self.grid_big_interface.attach(self.checkbox_steamgriddb, 0, 0, 2, 1)
-        self.grid_big_interface.attach(self.entry_steamgriddb_key, 0, 1, 1, 1)
-        self.grid_big_interface.attach(self.button_steamgriddb_key, 1, 1, 1, 1)
-        self.grid_big_interface.attach(self.label_startup_window_size, 0, 2, 2, 1)
-        self.grid_big_interface.attach(self.combobox_startup_window_size, 0, 3, 2, 1)
-        self.combobox_startup_window_size.set_hexpand(True)
-        self.grid_big_interface.attach(self.label_grid_position, 0, 4, 2, 1)
-        self.grid_big_interface.attach(self.combobox_grid_position, 0, 5, 2, 1)
-        self.combobox_grid_position.set_hexpand(True)
+        grid_steamgriddb.attach(self.checkbox_steamgriddb, 0, 0, 2, 1)
+        grid_steamgriddb.attach(self.entry_steamgriddb_key, 0, 1, 1, 1)
+        grid_steamgriddb.attach(self.button_steamgriddb_key, 1, 1, 1, 1)
         self.entry_steamgriddb_key.set_hexpand(True)
+
+        self.grid_big_interface.attach(self.label_startup_window_size, 0, 0, 2, 1)
+        self.grid_big_interface.attach(self.combobox_startup_window_size, 0, 1, 2, 1)
+        self.combobox_startup_window_size.set_hexpand(True)
+        self.grid_big_interface.attach(self.label_grid_position, 0, 2, 2, 1)
+        self.grid_big_interface.attach(self.combobox_grid_position, 0, 3, 2, 1)
+        self.combobox_grid_position.set_hexpand(True)
+        self.grid_big_interface.attach(self.label_grid_orientation, 0, 4, 2, 1)
+        self.grid_big_interface.attach(self.combobox_grid_orientation, 0, 5, 2, 1)
+        self.combobox_grid_orientation.set_hexpand(True)
+        self.grid_big_interface.attach(self.checkbox_grid_max_children, 0, 6, 2, 1)
+        self.grid_big_interface.attach(self.entry_grid_max_children, 0, 7, 2, 1)
 
         grid_support.attach(self.label_support, 0, 0, 2, 1)
         grid_support.attach(button_kofi, 0, 1, 1, 1)
         grid_support.attach(button_paypal, 1, 1, 1, 1)
 
-        box_left.append(grid_prefix)
-        box_left.append(grid_runner)
-        box_left.append(self.label_default_prefix_tools)
-        box_left.append(grid_tools)
-        box_left.append(grid_envar)
-        box_left.append(grid_language)
+        box_general_col1.append(grid_prefix)
+        box_general_col1.append(grid_runner)
+        box_general_col1.append(self.label_default_prefix_tools)
+        box_general_col1.append(grid_tools)
+        box_general_col1.append(grid_version)
 
-        box_mid.append(grid_miscellaneous)
-        box_mid.append(grid_logs)
-        box_mid.append(grid_backup)
+        box_general_col2.append(grid_miscellaneous)
 
-        box_right.append(grid_theme_accent)
-        box_right.append(self.grid_big_interface)
-        box_right.append(grid_theme_rest)
-        box_right.append(grid_support)
+        box_general_col3.append(grid_envar)
+        box_general_col3.append(grid_logs)
 
-        box_main.attach(box_left, 0, 0, 1, 1)
-        box_main.attach(box_right, 1, 0, 1, 1)
-        box_main.attach(box_mid, 2, 0, 1, 1)
-        box_left.set_hexpand(True)
-        box_mid.set_hexpand(True)
+        grid_page_general.attach(box_general_col1, 0, 0, 1, 1)
+        grid_page_general.attach(box_general_col2, 1, 0, 1, 1)
+        grid_page_general.attach(box_general_col3, 2, 0, 1, 1)
+        box_general_col1.set_hexpand(True)
+        box_general_col3.set_hexpand(True)
 
-        box_main_overlay = Gtk.Overlay()
-        box_main_overlay.set_child(box_main)
-        box_main_overlay.add_overlay(label_version)
+        box_interface_col1.append(grid_interface_mode)
+        box_interface_col1.append(self.grid_big_interface)
 
-        frame.set_child(box_main_overlay)
+        box_interface_col2.append(grid_theme_colors)
+        box_interface_col2.append(grid_steamgriddb)
+
+        box_interface_col3.append(grid_interface_checkboxes)
+
+        grid_page_interface.attach(box_interface_col1, 0, 0, 1, 1)
+        grid_page_interface.attach(box_interface_col2, 1, 0, 1, 1)
+        grid_page_interface.attach(box_interface_col3, 2, 0, 1, 1)
+        box_interface_col1.set_hexpand(True)
+        box_interface_col3.set_hexpand(True)
+
+        self.settings_view_stack = Gtk.Stack()
+
+        settings_tab_switcher = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        settings_tab_switcher.add_css_class("linked")
+        settings_tab_switcher.set_homogeneous(True)
+        settings_tab_switcher.set_hexpand(True)
+        settings_tab_switcher.set_margin_top(10)
+        settings_tab_switcher.set_margin_start(10)
+        settings_tab_switcher.set_margin_end(10)
+
+        settings_tab_pages = [
+            ("general", _("General"), grid_page_general),
+            ("interface", _("Interface"), grid_page_interface),
+        ]
+        first_settings_tab_button = None
+        for name, label, page in settings_tab_pages:
+            self.settings_view_stack.add_titled(page, name, label)
+            button = Gtk.ToggleButton(label=label)
+            button.set_focusable(False)
+            if first_settings_tab_button is None:
+                first_settings_tab_button = button
+                button.set_active(True)
+            else:
+                button.set_group(first_settings_tab_button)
+            button.connect(
+                "toggled",
+                lambda btn, n=name: self.settings_view_stack.set_visible_child_name(n) if btn.get_active() else None,
+            )
+            settings_tab_switcher.append(button)
+
+        box_settings_tabs = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        box_settings_tabs.append(settings_tab_switcher)
+        box_settings_tabs.append(self.settings_view_stack)
+
+        grid_outside_tabs = Gtk.Grid()
+        grid_outside_tabs.set_column_homogeneous(True)
+        grid_outside_tabs.set_column_spacing(10)
+        grid_outside_tabs.set_margin_top(10)
+
+        box_outside_col1 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        box_outside_col2 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        box_outside_col3 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+
+        box_outside_col1.append(grid_language)
+        box_outside_col2.append(grid_support)
+        box_outside_col3.append(grid_backup)
+
+        grid_outside_tabs.attach(box_outside_col1, 0, 0, 1, 1)
+        grid_outside_tabs.attach(box_outside_col2, 1, 0, 1, 1)
+        grid_outside_tabs.attach(box_outside_col3, 2, 0, 1, 1)
+        box_outside_col1.set_hexpand(True)
+        box_outside_col3.set_hexpand(True)
+
+        box_settings_root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        box_settings_root.append(box_settings_tabs)
+        box_settings_root.append(grid_outside_tabs)
+
+        frame.set_child(box_settings_root)
 
         box_bottom = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         box_bottom.set_homogeneous(True)
@@ -6037,9 +6493,24 @@ class Settings(Gtk.Dialog):
 
         self._refresh_banner_checkbox_sensitivity()
 
-        self.label_grid_position.set_sensitive(covers_or_carrousel)
-        self.combobox_grid_position.set_sensitive(covers_or_carrousel)
-        self.combobox_grid_position.set_tooltip_text(None if covers_or_carrousel else covers_carrousel_tip)
+        covers_carrousel_or_grid = active_id in ("Covers", "Carrousel", "Grid")
+        covers_carrousel_grid_tip = _("Grid, Covers or Carrousel mode")
+        self.label_grid_position.set_sensitive(covers_carrousel_or_grid)
+        self.combobox_grid_position.set_sensitive(covers_carrousel_or_grid)
+        self.combobox_grid_position.set_tooltip_text(None if covers_carrousel_or_grid else covers_carrousel_grid_tip)
+
+        self.checkbox_info.set_sensitive(covers_carrousel_or_grid)
+        self.checkbox_info.set_tooltip_text(None if covers_carrousel_or_grid else covers_carrousel_grid_tip)
+
+        grid_or_covers = active_id in ("Grid", "Covers")
+        grid_covers_tip = _("Grid or Covers mode")
+        self.label_grid_orientation.set_sensitive(grid_or_covers)
+        self.combobox_grid_orientation.set_sensitive(grid_or_covers)
+        self.combobox_grid_orientation.set_tooltip_text(None if grid_or_covers else grid_covers_tip)
+
+        self.checkbox_grid_max_children.set_sensitive(grid_or_covers)
+        self.entry_grid_max_children.set_sensitive(grid_or_covers and self.checkbox_grid_max_children.get_active())
+        self.checkbox_grid_max_children.set_tooltip_text(None if grid_or_covers else grid_covers_tip)
 
         self.label_startup_window_size.set_sensitive(not_list)
         self.combobox_startup_window_size.set_sensitive(not_list)
@@ -6082,6 +6553,9 @@ class Settings(Gtk.Dialog):
 
         if hasattr(self.parent, 'refresh_placeholder_covers'):
             self.parent.refresh_placeholder_covers()
+
+        if hasattr(self.parent, 'apply_info_panel_width'):
+            self.parent.apply_info_panel_width()
 
         if self.parent.background_mode == "accent" and hasattr(self.parent, 'update_accent_background_css'):
             self.parent.update_accent_background_css()
@@ -6143,12 +6617,16 @@ class Settings(Gtk.Dialog):
         config.set_value("auto-create-shortcuts", self.checkbox_auto_create_shortcuts.get_active())
         config.set_value("logging-enabled", self.checkbox_logging.get_active())
         config.set_value("show-hidden", self.checkbox_hidden_games.get_active())
+        config.set_value("info-enabled", self.checkbox_info.get_active())
         config.set_value("wayland-driver", self.checkbox_wayland_driver.get_active())
         config.set_value("wow64-enabled", self.checkbox_wow64.get_active())
         config.set_value("interface-mode", self.combobox_interface.get_active_id())
         config.set_value("background-mode", self.combobox_background.get_active_id())
         config.set_value("banner-enabled", self.checkbox_banner.get_active())
         config.set_value("grid-position", self.combobox_grid_position.get_active_id())
+        config.set_value("grid-orientation", self.combobox_grid_orientation.get_active_id())
+        config.set_value("grid-max-children-enabled", self.checkbox_grid_max_children.get_active())
+        config.set_value("grid-max-children-per-line", int(self.entry_grid_max_children.get_value()))
         config.set_value("labels-enabled", self.checkbox_labels.get_active())
         config.set_value("zoom-enabled", self.checkbox_zoom.get_active())
         config.set_value("steamgriddb-enabled", self.checkbox_steamgriddb.get_active())
@@ -6505,6 +6983,7 @@ class Settings(Gtk.Dialog):
         auto_create_shortcuts = cfg.config.get('auto-create-shortcuts', 'False') == 'True'
         logging_enabled = cfg.config.get('logging-enabled', 'False') == 'True'
         show_hidden = cfg.config.get('show-hidden', 'False') == 'True'
+        info_enabled = cfg.config.get('info-enabled', 'False') == 'True'
         gamepad_navigation = cfg.config.get('gamepad-navigation', 'False') == 'True'
         wayland_driver = cfg.config.get('wayland-driver', 'False') == 'True'
         wow64_enabled = cfg.config.get('wow64-enabled', 'False') == 'True'
@@ -6516,6 +6995,9 @@ class Settings(Gtk.Dialog):
         header_bar = cfg.config.get('header-bar', 'False') == 'True'
         startup_window_size = cfg.config.get('startup-window-size', '')
         grid_position = cfg.config.get('grid-position', 'Middle').strip('"')
+        grid_orientation = cfg.config.get('grid-orientation', 'Vertical').strip('"')
+        grid_max_children_enabled = cfg.config.get('grid-max-children-enabled', 'False') == 'True'
+        grid_max_children_per_line = int(cfg.config.get('grid-max-children-per-line', 20))
         self.interface_theme = cfg.config.get('interface-theme', 'system')
         self.accent_color = cfg.config.get('accent-color', 'system')
         self.theme_engine = cfg.config.get('theme-engine', 'adwaita').strip('"')
@@ -6548,6 +7030,7 @@ class Settings(Gtk.Dialog):
         self.checkbox_auto_create_shortcuts.set_active(auto_create_shortcuts)
         self.checkbox_logging.set_active(logging_enabled)
         self.checkbox_hidden_games.set_active(show_hidden)
+        self.checkbox_info.set_active(info_enabled)
         self.checkbox_gamepad_navigation.set_active(gamepad_navigation)
         self.checkbox_wayland_driver.set_active(wayland_driver)
         self.checkbox_wow64.set_active(wow64_enabled)
@@ -6555,6 +7038,12 @@ class Settings(Gtk.Dialog):
         self.combobox_background.set_active_id(background_mode)
         self.checkbox_banner.set_active(banner_enabled)
         self.combobox_grid_position.set_active_id(grid_position)
+        self.combobox_grid_orientation.set_active_id(grid_orientation)
+        self.checkbox_grid_max_children.set_active(grid_max_children_enabled)
+        self.entry_grid_max_children.set_value(grid_max_children_per_line)
+
+        self.combobox_theme.handler_block(self._combobox_theme_handler)
+        self.combobox_accent.handler_block(self._combobox_accent_handler)
 
         if not self.combobox_theme_engine.set_active_id(self.theme_engine):
             self.combobox_theme_engine.set_active_id("adwaita")
@@ -6571,6 +7060,9 @@ class Settings(Gtk.Dialog):
 
         self.combobox_theme.set_active_id(loaded_theme)
         self.combobox_accent.set_active_id("custom" if is_custom_accent else "system")
+
+        self.combobox_theme.handler_unblock(self._combobox_theme_handler)
+        self.combobox_accent.handler_unblock(self._combobox_accent_handler)
 
         self.interface_theme = loaded_theme
         self.accent_color = loaded_accent
@@ -6645,6 +7137,7 @@ class Game:
         steam_user="",
         disable_umu="",
         runtime="",
+        last_played="",
     ):
         self.gameid = gameid
         self.title = title
@@ -6681,6 +7174,7 @@ class Game:
         self.steam_user = steam_user
         self.disable_umu = disable_umu
         self.runtime = runtime
+        self.last_played = last_played
 
 
 class DuplicateDialog(Gtk.Dialog):

@@ -9,6 +9,7 @@ import time
 import shlex
 import signal
 import warnings
+from datetime import datetime
 
 warnings.filterwarnings('ignore', category=DeprecationWarning)
 
@@ -747,9 +748,19 @@ class FaugusRun(HiDpiMixin):
                     if game.get("gameid") == game_id:
                         old_time = game.get("playtime", 0)
                         game["playtime"] = old_time + runtime
+                        game["last_played"] = datetime.now().isoformat()
                         break
 
                 save_json_file(games, GAMES_JSON)
+
+            try:
+                connection = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+                connection.call_sync(
+                    TRAY_BUS_NAME, TRAY_OBJECT_PATH, TRAY_INTERFACE, "RefreshMenu",
+                    None, None, Gio.DBusCallFlags.NONE, -1, None,
+                )
+            except GLib.Error:
+                pass
 
         if self.logging_enabled:
             target_dir = f"{LOGS_DIR}/{self.log_dir}"
