@@ -22,6 +22,7 @@ from faugus.steam_setup import *
 from faugus.ea_fix import *
 from faugus.migration import fix_legacy_shortcut_icons
 from faugus.main_screen_nav import adjust_widget_value, carrousel_move_coalesced, focus_bottom_bar_by_column, focus_flowbox_child, focus_top_bar, navigate_focus
+from faugus.tray_only import spawn as tray_only_spawn
 
 VERSION = "2.3.0"
 
@@ -118,6 +119,7 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
         self.games = []
 
         self.processes = {}
+        self.play_sessions = {}
 
         if not os.path.exists(RUNNING_GAMES):
             save_json_file({}, RUNNING_GAMES)
@@ -1013,6 +1015,11 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
         if self.running or changed:
             self.update_icon()
 
+        if self.running:
+            selected_game = self.selected()
+            if selected_game and selected_game.gameid in self.running:
+                self.update_info_panel()
+
         return True
 
     def save_running(self):
@@ -1058,15 +1065,7 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
             pass
 
     def start_tray_daemon(self):
-        proc = subprocess.Popen(
-            [sys.executable, "-m", "faugus.tray_only", "--hide"],
-            env=subprocess_env(),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            close_fds=True,
-        )
-        GLib.child_watch_add(proc.pid, lambda pid, status: None)
+        tray_only_spawn(["faugus.tray_only", "--hide"])
 
     def ensure_tray_daemon(self, force_restart=False):
         connection, running = self.tray_daemon_running()
@@ -2845,7 +2844,10 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
         label_menu_title.add_css_class("heading")
         label_menu_title.set_margin_bottom(4)
 
+        is_running = game.gameid in self.running
+
         formatted = None
+        last_played_iso = None
         last_played_text = None
         last_played_exact = None
         data = load_json_file(GAMES_JSON, [])
@@ -2873,15 +2875,24 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
         label_menu_playtime.set_margin_bottom(4)
         label_menu_playtime.set_visible(bool(formatted))
 
-        never_played = not formatted and not last_played_text
-        label_menu_last_played = Gtk.Label(
-            label=_("Last played: {}").format(last_played_text) if last_played_text
-            else (_("Never played") if never_played else "")
-        )
+        if is_running:
+            session_start = self.play_sessions.get(game.gameid, (None, 0))[0]
+            playing_for_text = self.format_playing_for(session_start)
+            last_played_label_text = _("Playing for: {}").format(playing_for_text) if playing_for_text else ""
+            last_played_label_visible = bool(playing_for_text)
+        else:
+            never_played = not formatted and not last_played_text
+            last_played_label_text = (
+                _("Last played: {}").format(last_played_text) if last_played_text
+                else (_("Never played") if never_played else "")
+            )
+            last_played_label_visible = bool(last_played_text) or never_played
+
+        label_menu_last_played = Gtk.Label(label=last_played_label_text)
         label_menu_last_played.set_halign(Gtk.Align.START)
         label_menu_last_played.set_margin_bottom(4)
-        label_menu_last_played.set_visible(bool(last_played_text) or never_played)
-        if last_played_exact:
+        label_menu_last_played.set_visible(last_played_label_visible)
+        if last_played_exact and not is_running:
             label_menu_last_played.set_tooltip_text(last_played_exact)
 
         header_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
@@ -2902,7 +2913,13 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
             self.action_context_show_logs.set_enabled(False)
 
         hide_label = _("Remove from hidden") if game.hidden else _("Hide")
-        play_label = _("Stop") if game.gameid in self.running else _("Play")
+        supports_logs = game.runner not in ("Steam", "Linux-Native")
+        if is_running:
+            play_label = _("Stop")
+        elif supports_logs:
+            play_label = _("Play with logs")
+        else:
+            play_label = _("Play")
 
         categories = sorted(
             [cat.strip() for cat in load_json_file(CATEGORIES_FILE, default=[]) if cat.strip()],
@@ -2933,7 +2950,7 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
         show_game_location = True
         show_prefix_location = game.runner != "Linux-Native"
         show_run = game.runner not in ("Steam", "Linux-Native")
-        show_logs_item = self.logging_enabled and game.runner not in ("Steam", "Linux-Native")
+        show_logs_item = supports_logs
 
         if game.runner == "Steam":
             steam_game_dir, steam_prefix_dir = get_steam_app_paths(game.path)
@@ -3143,16 +3160,28 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
 
         return " ".join(parts)
 
-    def format_last_played(self, last_played_iso):
-        if not last_played_iso:
+    def elapsed_seconds_since(self, start_iso):
+        if not start_iso:
             return None
 
         try:
-            played_at = datetime.fromisoformat(last_played_iso)
+            started_at = datetime.fromisoformat(start_iso)
         except ValueError:
             return None
 
-        seconds = (datetime.now() - played_at).total_seconds()
+        return max(0, (datetime.now() - started_at).total_seconds())
+
+    def format_playing_for(self, start_iso):
+        seconds = self.elapsed_seconds_since(start_iso)
+        if seconds is None:
+            return None
+        return self.format_playtime(seconds) or _("Less than a minute")
+
+    def format_last_played(self, last_played_iso):
+        seconds = self.elapsed_seconds_since(last_played_iso)
+        if seconds is None:
+            return None
+
         if seconds < 60:
             return _("Just now")
 
@@ -3213,17 +3242,17 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
         stats_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
         stats_row.set_halign(Gtk.Align.CENTER)
 
-        self.label_info_playtime = Gtk.Label()
-        self.label_info_playtime.add_css_class("info-panel-stat")
-        stats_row.append(self.label_info_playtime)
+        self.label_info_categories = Gtk.Label()
+        self.label_info_categories.add_css_class("info-panel-stat")
+        stats_row.append(self.label_info_categories)
 
         self.label_info_sep1 = Gtk.Label(label="•")
         self.label_info_sep1.add_css_class("info-panel-stat")
         stats_row.append(self.label_info_sep1)
 
-        self.label_info_categories = Gtk.Label()
-        self.label_info_categories.add_css_class("info-panel-stat")
-        stats_row.append(self.label_info_categories)
+        self.label_info_playtime = Gtk.Label()
+        self.label_info_playtime.add_css_class("info-panel-stat")
+        stats_row.append(self.label_info_playtime)
 
         self.label_info_sep2 = Gtk.Label(label="•")
         self.label_info_sep2.add_css_class("info-panel-stat")
@@ -3310,7 +3339,13 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
         panel.set_visible(True)
         self.label_info_title.set_text(game.title)
 
-        if game.runner == "Steam":
+        is_running = game.gameid in self.running
+        session_start, session_baseline_playtime = self.play_sessions.get(game.gameid, (None, game.playtime))
+
+        if is_running:
+            elapsed = self.elapsed_seconds_since(session_start) or 0
+            formatted_playtime = self.format_playtime(session_baseline_playtime + elapsed)
+        elif game.runner == "Steam":
             steam_minutes = get_steam_app_playtime_minutes(game.path, game.steam_user)
             formatted_playtime = self.format_playtime(steam_minutes * 60)
         else:
@@ -3326,18 +3361,26 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
         self.label_info_categories.set_text(", ".join(categories) if categories else "")
         self.label_info_categories.set_visible(categories_visible)
 
-        last_played_text = self.format_last_played(game.last_played)
-        last_played_visible = bool(last_played_text)
-        self.label_info_last_played.set_text(
-            _("Last played: {}").format(last_played_text) if last_played_text else ""
-        )
-        self.label_info_last_played.set_visible(last_played_visible)
-        if game.last_played:
-            self.label_info_last_played.set_tooltip_text(
-                datetime.fromisoformat(game.last_played).strftime("%Y-%m-%d %H:%M")
+        if is_running:
+            playing_for_text = self.format_playing_for(session_start)
+            last_played_visible = bool(playing_for_text)
+            self.label_info_last_played.set_text(
+                _("Playing for: {}").format(playing_for_text) if playing_for_text else ""
             )
-        else:
             self.label_info_last_played.set_tooltip_text(None)
+        else:
+            last_played_text = self.format_last_played(game.last_played)
+            last_played_visible = bool(last_played_text)
+            self.label_info_last_played.set_text(
+                _("Last played: {}").format(last_played_text) if last_played_text else ""
+            )
+            if game.last_played:
+                self.label_info_last_played.set_tooltip_text(
+                    datetime.fromisoformat(game.last_played).strftime("%Y-%m-%d %H:%M")
+                )
+            else:
+                self.label_info_last_played.set_tooltip_text(None)
+        self.label_info_last_played.set_visible(last_played_visible)
 
         self.label_info_sep1.set_visible(playtime_visible and categories_visible)
         self.label_info_sep2.set_visible((playtime_visible or categories_visible) and last_played_visible)
@@ -3346,7 +3389,8 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
         self.context_menu.popdown()
         game = self.selected()
         if game:
-            self.on_button_play_clicked(None, game)
+            supports_logs = game.runner not in ("Steam", "Linux-Native")
+            self.on_button_play_clicked(None, game, with_logs=supports_logs)
 
     def on_context_menu_edit(self, action, param):
         self.context_menu.popdown()
@@ -3705,6 +3749,10 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
         else:
             new_cover = ""
 
+        banner = f"{BANNERS_DIR}/{game.gameid}.png"
+        if os.path.isfile(banner):
+            shutil.copyfile(banner, f"{BANNERS_DIR}/{title_formatted}.png")
+
         new_addapp_bat = f"{os.path.dirname(expand_path(game.path))}/faugus-{title_formatted}.bat"
         if os.path.exists(expand_path(game.addapp_bat)):
             shutil.copyfile(expand_path(game.addapp_bat), new_addapp_bat)
@@ -3754,10 +3802,11 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
             try:
                 config = ConfigManager()
                 current = config.config.get("show-hidden", "False")
-                config.set_value("show-hidden", "False" if current == "True" else "True")
+                new_value = "False" if current == "True" else "True"
+                config.set_value("show-hidden", new_value)
                 config.save_config()
 
-                self.load_config()
+                self.show_hidden = new_value == "True"
                 self.apply_show_hidden_change()
                 self.select_first_child_when_ready()
                 return True
@@ -3839,7 +3888,6 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
         self.steamgriddb_enabled = cfg.config.get('steamgriddb-enabled', 'False') == 'True'
         self.labels_enabled = cfg.config.get('labels-enabled', 'False') == 'True'
         self.zoom_enabled = cfg.config.get('zoom-enabled', 'True') == 'True'
-        self.logging_enabled = cfg.config.get('logging-enabled', 'False') == 'True'
         self.gamepad_navigation = cfg.config.get('gamepad-navigation', 'False') == 'True'
         self.language = cfg.config.get('language', '')
         self.show_hidden = cfg.config.get('show-hidden', 'False') == 'True'
@@ -4318,19 +4366,7 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
 
                 destroy_and_release(settings_dialog)
 
-            def proceed():
-                if not settings_dialog.logging_warning and settings_dialog.checkbox_logging.get_active():
-                    settings_dialog.logging_warning = True
-                    self.show_warning_dialog_main(
-                        self,
-                        _("Proton may generate huge log files."),
-                        _("Enable logging only when debugging a problem."),
-                        callback=lambda confirmed: finish_settings()
-                    )
-                else:
-                    finish_settings()
-
-            proceed()
+            finish_settings()
 
         else:
             apply_interface_customization(
@@ -4393,7 +4429,7 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
             if os.path.exists(autostart_path):
                 os.remove(autostart_path)
 
-    def on_button_play_clicked(self, widget=None, game=None):
+    def on_button_play_clicked(self, widget=None, game=None, with_logs=False):
         self.button_play.set_sensitive(False)
 
         def reenable():
@@ -4435,18 +4471,14 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
         game_directory = os.path.dirname(expand_path(game.path))
         cwd = game_directory if game_directory and os.path.isdir(game_directory) else None
 
+        cmd = [sys.executable, "-m", "faugus.runner", "--game", gameid]
+        if with_logs:
+            cmd.append("--logs")
+
         if game.runner == "Steam":
             self.update_last_played(gameid)
             self.sync_last_played_order(gameid)
-            subprocess.Popen(
-                [sys.executable, "-m", "faugus.runner", "--game", gameid],
-                cwd=cwd,
-                env=subprocess_env(),
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                close_fds=True
-            )
+            subprocess.Popen(cmd, cwd=cwd, env=subprocess_env())
             return
 
         if gameid in self.running:
@@ -4461,17 +4493,15 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
             self.update_icon()
             return
 
-        self.update_last_played(gameid)
-        self.sync_last_played_order(gameid)
-
-        cmd = (sys.executable, "-m", "faugus.runner", "--game", gameid)
-        proc = subprocess.Popen(cmd, cwd=cwd if cwd else None, env=subprocess_env())
+        proc = subprocess.Popen(cmd, cwd=cwd, env=subprocess_env())
 
         if not IS_FLATPAK or not self.auto_close_on_launch:
             self.running[gameid] = proc.pid
             self.processes[gameid] = proc
+            self.play_sessions[gameid] = (datetime.now().isoformat(), game.playtime)
             GLib.child_watch_add(proc.pid, self.on_exit, gameid)
             self.save_running()
+            self.update_info_panel()
 
         if self.auto_close_on_launch:
             sys.exit()
@@ -4483,6 +4513,7 @@ class Main(Gtk.ApplicationWindow, HiDpiMixin):
     def on_exit(self, pid, status, game):
         self.running.pop(game, None)
         self.processes.pop(game, None)
+        self.play_sessions.pop(game, None)
         self.save_running()
 
         self.reload_playtimes()
@@ -5701,7 +5732,6 @@ class Settings(Gtk.Dialog):
         self.set_resizable(False)
 
         self.parent = parent
-        self.logging_warning = False
         self.modified = False
 
         add_css_once("settings_dialog", """
@@ -5995,9 +6025,6 @@ class Settings(Gtk.Dialog):
             _("Automatically creates shortcuts when installing something through the file manager")
         )
 
-        self.checkbox_logging = Gtk.CheckButton(label=_("Logging"))
-        self.checkbox_logging.set_active(False)
-
         self.checkbox_categories = Gtk.CheckButton(label=_("Categories"))
 
         self.checkbox_sort = Gtk.CheckButton(label=_("Sort"))
@@ -6200,8 +6227,7 @@ class Settings(Gtk.Dialog):
         grid_tools.attach(self.checkbox_sdl, 0, 3, 1, 1)
         grid_tools.attach(box_buttons, 2, 0, 1, 4)
 
-        grid_logs.attach(self.checkbox_logging, 0, 0, 1, 1)
-        grid_logs.attach(self.button_clearlogs, 0, 1, 1, 1)
+        grid_logs.attach(self.button_clearlogs, 0, 0, 1, 1)
         self.button_clearlogs.set_hexpand(True)
 
         grid_version.attach(label_version, 0, 0, 1, 1)
@@ -6597,7 +6623,6 @@ class Settings(Gtk.Dialog):
         entry_default_prefix = self.entry_default_prefix.get_text()
         combobox_default_runner = self.get_default_runner()
         language = self.combobox_language.get_active_id()
-        logging_warning = self.logging_warning
 
         config = ConfigManager()
         config.set_value("language", language)
@@ -6615,7 +6640,6 @@ class Settings(Gtk.Dialog):
         config.set_value("mono-icon", self.checkbox_mono_icon.get_active())
         config.set_value("auto-close-on-launch", self.checkbox_auto_close_on_launch.get_active())
         config.set_value("auto-create-shortcuts", self.checkbox_auto_create_shortcuts.get_active())
-        config.set_value("logging-enabled", self.checkbox_logging.get_active())
         config.set_value("show-hidden", self.checkbox_hidden_games.get_active())
         config.set_value("info-enabled", self.checkbox_info.get_active())
         config.set_value("wayland-driver", self.checkbox_wayland_driver.get_active())
@@ -6631,7 +6655,6 @@ class Settings(Gtk.Dialog):
         config.set_value("zoom-enabled", self.checkbox_zoom.get_active())
         config.set_value("steamgriddb-enabled", self.checkbox_steamgriddb.get_active())
         config.set_value("steamgriddb-api-key", self.entry_steamgriddb_key.get_text().strip())
-        config.set_value("logging-warning", logging_warning)
         config.set_value("gamepad-navigation", self.checkbox_gamepad_navigation.get_active())
         config.set_value("minimized-startup-enabled", self.checkbox_minimized_startup.get_active())
         config.set_value("categories-enabled", self.checkbox_categories.get_active())
@@ -6981,14 +7004,12 @@ class Settings(Gtk.Dialog):
         steamgriddb_enabled = cfg.config.get('steamgriddb-enabled', 'False') == 'True'
         steamgriddb_api_key = cfg.config.get('steamgriddb-api-key', '').strip('"')
         auto_create_shortcuts = cfg.config.get('auto-create-shortcuts', 'False') == 'True'
-        logging_enabled = cfg.config.get('logging-enabled', 'False') == 'True'
         show_hidden = cfg.config.get('show-hidden', 'False') == 'True'
         info_enabled = cfg.config.get('info-enabled', 'False') == 'True'
         gamepad_navigation = cfg.config.get('gamepad-navigation', 'False') == 'True'
         wayland_driver = cfg.config.get('wayland-driver', 'False') == 'True'
         wow64_enabled = cfg.config.get('wow64-enabled', 'False') == 'True'
         self.language = cfg.config.get('language', '')
-        self.logging_warning = cfg.config.get('logging-warning', 'False') == 'True'
         minimized_startup_enabled = cfg.config.get('minimized-startup-enabled', 'False') == 'True'
         categories_enabled = cfg.config.get('categories-enabled', 'False') == 'True'
         sort_enabled = cfg.config.get('sort-enabled', 'False') == 'True'
@@ -7028,7 +7049,6 @@ class Settings(Gtk.Dialog):
         self.on_checkbox_steamgriddb_toggled(self.checkbox_steamgriddb)
         self.entry_steamgriddb_key.set_text(steamgriddb_api_key)
         self.checkbox_auto_create_shortcuts.set_active(auto_create_shortcuts)
-        self.checkbox_logging.set_active(logging_enabled)
         self.checkbox_hidden_games.set_active(show_hidden)
         self.checkbox_info.set_active(info_enabled)
         self.checkbox_gamepad_navigation.set_active(gamepad_navigation)
@@ -8932,6 +8952,10 @@ class AddGame(Gtk.Dialog, HiDpiMixin):
                     if detected_path:
                         GLib.idle_add(self.entry_path.set_text, detected_path)
 
+                        if not self.steamgriddb_enabled:
+                            status = self.extract_shortcut_icon(detected_path)
+                            GLib.idle_add(self.apply_shortcut_icon_status, status)
+
                 run_in_background(run_command)
 
             destroy_and_release(dialog_fc)
@@ -8946,6 +8970,17 @@ class AddGame(Gtk.Dialog, HiDpiMixin):
         image = new_picture(surface)
 
         return image
+
+    def extract_shortcut_icon(self, path):
+        os.makedirs(self.icon_directory, exist_ok=True)
+        return extract_ico(path, self.icon_temp, best_frame=True)
+
+    def apply_shortcut_icon_status(self, status):
+        if status == "ok":
+            surface = self.new_texture_from_image(self.icon_temp, 50, 50)
+            self.button_shortcut_icon.set_child(new_picture(surface))
+        elif status == "no_icons":
+            self.button_shortcut_icon.set_child(self.set_image_shortcut_icon())
 
     def on_combobox_steam_shortcut_user_changed(self, combobox):
         title = self.entry_title.get_text().strip()
@@ -9117,13 +9152,8 @@ class AddGame(Gtk.Dialog, HiDpiMixin):
                 path = dialog_fc.get_file().get_path()
 
                 if not self.steamgriddb_enabled:
-                    os.makedirs(self.icon_directory, exist_ok=True)
-                    status = extract_ico(path, self.icon_temp, best_frame=True)
-                    if status == "ok":
-                        surface = self.new_texture_from_image(self.icon_temp, 50, 50)
-                        self.button_shortcut_icon.set_child(new_picture(surface))
-                    elif status == "no_icons":
-                        self.button_shortcut_icon.set_child(self.set_image_shortcut_icon())
+                    status = self.extract_shortcut_icon(path)
+                    self.apply_shortcut_icon_status(status)
 
                 self.entry_path.set_text(path)
 

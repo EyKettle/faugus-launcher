@@ -87,12 +87,13 @@ def warm_up_gpu():
 
 
 class FaugusRun(HiDpiMixin):
-    def __init__(self, message, command=None, pre_launch="", post_launch="", gameid=""):
+    def __init__(self, message, command=None, pre_launch="", post_launch="", gameid="", with_logs=False):
         self.message = message
         self.command = command
         self.pre_launch = pre_launch
         self.post_launch = post_launch
         self.gameid = gameid
+        self.logging_enabled = with_logs
         self.process = None
         self.splash_window = None
         self.log_window = None
@@ -302,10 +303,11 @@ class FaugusRun(HiDpiMixin):
                 self.process = process
                 GLib.child_watch_add(GLib.PRIORITY_DEFAULT, process.pid, self.on_process_exit)
                 Thread(target=self._watch_game_process, daemon=True).start()
+                self.progress_save_source = GLib.timeout_add_seconds(30, self._save_progress_tick)
                 if log_file:
                     def close_log_later():
                         for t in threads:
-                            t.join(timeout=5)
+                            t.join()
                         log_file.flush()
                         log_file.close()
                     Thread(target=close_log_later, daemon=True).start()
@@ -348,6 +350,15 @@ class FaugusRun(HiDpiMixin):
 
         game_cmd = popen_prefix + shlex.split(self.message)
         self.start_time = time.time()
+
+        self.cfg_playtime_baseline = self.playtime
+        self.game_playtime_baseline = 0
+        if self.gameid:
+            for saved_game in load_json_file(GAMES_JSON, []):
+                if saved_game.get("gameid") == self.gameid:
+                    self.game_playtime_baseline = saved_game.get("playtime", 0)
+                    break
+
         start_and_watch(game_cmd, is_game=True)
 
     def show_donate_dialog(self):
@@ -504,7 +515,6 @@ class FaugusRun(HiDpiMixin):
         self.default_runner = self.cfg.config.get('default-runner', '')
         self.lossless_location = expand_path(self.cfg.config.get('lossless-location', ''))
         self.default_prefix = expand_path(self.cfg.config.get('default-prefix', ''))
-        self.logging_enabled = self.cfg.config.get('logging-enabled', 'False') == 'True'
         self.wayland_driver = self.cfg.config.get('wayland-driver', 'False') == 'True'
         self.wow64_enabled = self.cfg.config.get('wow64-enabled', 'False') == 'True'
         self.show_donate = self.cfg.config.get('show-donate', 'False') == 'True'
@@ -702,6 +712,30 @@ class FaugusRun(HiDpiMixin):
 
         return False
 
+    def _save_progress_tick(self):
+        self._save_progress()
+        return True
+
+    def _save_progress(self):
+        runtime = int(time.time() - self.start_time)
+        if runtime <= 0:
+            return
+
+        self.cfg.load_config()
+        self.cfg.set_value("playtime", self.cfg_playtime_baseline + runtime)
+        self.cfg.save_config()
+
+        if not self.gameid:
+            return
+
+        games = load_json_file(GAMES_JSON, [])
+        for game in games:
+            if game.get("gameid") == self.gameid:
+                game["playtime"] = self.game_playtime_baseline + runtime
+                game["last_played"] = datetime.now().isoformat()
+                break
+        save_json_file(games, GAMES_JSON)
+
     def on_process_exit(self, pid, condition):
         import psutil
 
@@ -725,34 +759,19 @@ class FaugusRun(HiDpiMixin):
                 except psutil.NoSuchProcess:
                     pass
 
-        end_time = time.time()
-        runtime = int(end_time - getattr(self, "start_time", end_time))
-
         if self.post_launch:
             try:
                 subprocess.Popen(self.post_launch, shell=True, env=child_env())
             except Exception as e:
                 print(f"Error running post-launch command: {e}")
 
-        self.cfg.load_config()
-        self.playtime = int(self.cfg.config.get("playtime", 0))
-        self.cfg.set_value("playtime", self.playtime + runtime)
-        self.cfg.save_config()
+        if getattr(self, "progress_save_source", None):
+            GLib.source_remove(self.progress_save_source)
+            self.progress_save_source = None
 
-        game_id = os.environ.get("FAUGUSID")
+        self._save_progress()
 
-        if game_id:
-            games = load_json_file(GAMES_JSON, [])
-            if games:
-                for game in games:
-                    if game.get("gameid") == game_id:
-                        old_time = game.get("playtime", 0)
-                        game["playtime"] = old_time + runtime
-                        game["last_played"] = datetime.now().isoformat()
-                        break
-
-                save_json_file(games, GAMES_JSON)
-
+        if self.gameid:
             try:
                 connection = Gio.bus_get_sync(Gio.BusType.SESSION, None)
                 connection.call_sync(
@@ -935,6 +954,7 @@ def main():
     parser.add_argument("--game")
     parser.add_argument("--pre-launch", default="")
     parser.add_argument("--post-launch", default="")
+    parser.add_argument("--logs", action="store_true")
 
     args = parser.parse_args()
 
@@ -944,9 +964,9 @@ def main():
             return
 
         launch_options = build_launch_command(game)
-        FaugusRun(launch_options, None, game.get("pre_launch", ""), game.get("post_launch", ""), args.game).run()
+        FaugusRun(launch_options, None, game.get("pre_launch", ""), game.get("post_launch", ""), args.game, with_logs=args.logs).run()
     else:
-        FaugusRun(args.message, args.command, args.pre_launch, args.post_launch).run()
+        FaugusRun(args.message, args.command, args.pre_launch, args.post_launch, with_logs=args.logs).run()
 
 
 if __name__ == "__main__":

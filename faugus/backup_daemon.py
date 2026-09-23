@@ -115,6 +115,37 @@ def format_size(num_bytes):
     return f"{size:.2f} TB"
 
 
+def get_free_space_bytes(path):
+    while path and not os.path.isdir(path):
+        parent = os.path.dirname(path)
+        if parent == path:
+            return None
+        path = parent
+    if not path:
+        return None
+    try:
+        return shutil.disk_usage(path).free
+    except OSError:
+        return None
+
+
+def estimate_backup_size_bytes(prefixes, shortcuts, protons):
+    total = get_settings_size_bytes()
+    for entry in prefixes:
+        if os.path.isdir(entry.get("path", "")):
+            total += get_dir_size(entry["path"])
+    for entry in shortcuts:
+        for file_path in entry.get("files") or []:
+            try:
+                total += os.path.getsize(file_path)
+            except OSError:
+                pass
+    for entry in protons:
+        if os.path.isdir(entry.get("path", "")):
+            total += get_dir_size(entry["path"])
+    return total
+
+
 def list_game_prefixes():
     games = load_json_file(GAMES_JSON, default=[])
     result = []
@@ -127,13 +158,13 @@ def list_game_prefixes():
         if not prefix:
             continue
         path = expand_path(prefix)
-        if not path or not os.path.isdir(path):
+        if not path:
             continue
         gameid = game.get('gameid', '')
         title = game.get('title', '') or gameid
         if not gameid:
             continue
-        result.append({"gameid": gameid, "title": title, "path": path})
+        result.append({"gameid": gameid, "title": title, "path": path, "has_prefix": os.path.isdir(path)})
 
     result.sort(key=lambda item: item["title"].lower())
 
@@ -142,7 +173,7 @@ def list_game_prefixes():
     if default_prefix_base:
         default_path = os.path.join(default_prefix_base, "default")
         if os.path.isdir(default_path):
-            result.insert(0, {"gameid": "default", "title": _("Default Prefix"), "path": default_path})
+            result.insert(0, {"gameid": "default", "title": _("Default Prefix"), "path": default_path, "has_prefix": True})
 
     return result
 
@@ -240,6 +271,28 @@ def _copy_dir_including(src, dst, included_basenames):
             _link_or_copy(entry.path, target)
 
 
+BACKUP_LOCK_FILE = os.path.join(FAUGUS_LAUNCHER_STATE_DIR, "backup.lock")
+BACKUP_CANCEL_FILE = os.path.join(FAUGUS_LAUNCHER_STATE_DIR, "backup.cancel")
+
+
+class BackupCancelled(Exception):
+    pass
+
+
+def is_backup_running():
+    return os.path.exists(BACKUP_LOCK_FILE)
+
+
+def request_backup_cancel():
+    os.makedirs(FAUGUS_LAUNCHER_STATE_DIR, exist_ok=True)
+    open(BACKUP_CANCEL_FILE, "w").close()
+
+
+def _raise_if_backup_cancelled():
+    if os.path.exists(BACKUP_CANCEL_FILE):
+        raise BackupCancelled()
+
+
 def perform_backup(dest_path, prefixes=None, shortcuts=None, protons=None, games=None):
     prefixes = prefixes or []
     shortcuts = shortcuts or []
@@ -247,115 +300,139 @@ def perform_backup(dest_path, prefixes=None, shortcuts=None, protons=None, games
     games = games or []
     dest_path = expand_path(dest_path)
     temp_dir = os.path.join(FAUGUS_TEMP, "temp-backup")
-    if os.path.isdir(temp_dir):
-        shutil.rmtree(temp_dir)
-    os.makedirs(temp_dir, exist_ok=True)
 
-    manifest = {
-        "version": 2,
-        "prefixes": [],
-        "shortcuts": [],
-        "protons": [],
-    }
+    os.makedirs(FAUGUS_LAUNCHER_STATE_DIR, exist_ok=True)
+    if os.path.exists(BACKUP_CANCEL_FILE):
+        os.remove(BACKUP_CANCEL_FILE)
+    open(BACKUP_LOCK_FILE, "w").close()
 
-    settings_dir = os.path.join(temp_dir, "settings")
-    temp_root = os.path.realpath(FAUGUS_TEMP)
+    try:
+        if os.path.isdir(temp_dir):
+            shutil.rmtree(temp_dir)
+        os.makedirs(temp_dir, exist_ok=True)
 
-    all_games = load_json_file(GAMES_JSON, default=[])
-    included_image_basenames = set()
-    for entry in all_games:
-        if not isinstance(entry, dict) or entry.get("gameid") not in games:
-            continue
-        included_image_basenames.add(f"{entry['gameid']}.png")
-        for field in ("cover", "icon"):
-            value = entry.get(field) or ""
-            if value:
-                included_image_basenames.add(os.path.basename(value))
+        manifest = {
+            "version": 2,
+            "games": [],
+            "prefixes": [],
+            "shortcuts": [],
+            "protons": [],
+        }
 
-    faugus_roots = {
-        "config": os.path.realpath(os.path.dirname(CONFIG_FILE_DIR)),
-        "data": os.path.realpath(FAUGUS_LAUNCHER_SHARE_DIR),
-        "state": os.path.realpath(FAUGUS_LAUNCHER_STATE_DIR),
-    }
-    for root_name, root_path in faugus_roots.items():
-        if not os.path.isdir(root_path):
-            continue
-        dst_root = os.path.join(settings_dir, root_name)
-        for entry in os.scandir(root_path):
-            if entry.path == temp_root:
+        settings_dir = os.path.join(temp_dir, "settings")
+        temp_root = os.path.realpath(FAUGUS_TEMP)
+
+        all_games = load_json_file(GAMES_JSON, default=[])
+        included_image_basenames = set()
+        for entry in all_games:
+            if not isinstance(entry, dict) or entry.get("gameid") not in games:
                 continue
-            os.makedirs(dst_root, exist_ok=True)
-            target = os.path.join(dst_root, entry.name)
-            if entry.name == "games.json":
-                filtered_games = [g for g in all_games if isinstance(g, dict) and g.get("gameid") in games]
-                save_json_file(filtered_games, target)
-            elif entry.name in ("covers", "banners", "icons"):
-                _copy_dir_including(entry.path, target, included_image_basenames)
-            elif entry.is_dir(follow_symlinks=False):
-                shutil.copytree(entry.path, target, dirs_exist_ok=True, copy_function=_link_or_copy)
-            else:
-                _link_or_copy(entry.path, target)
+            manifest["games"].append({"gameid": entry["gameid"], "title": entry.get("title", entry["gameid"])})
+            included_image_basenames.add(f"{entry['gameid']}.png")
+            for field in ("cover", "icon"):
+                value = entry.get(field) or ""
+                if value:
+                    included_image_basenames.add(os.path.basename(value))
 
-    for prefix_info in prefixes:
-        gameid = prefix_info["gameid"]
-        src = prefix_info["path"]
-        dst = os.path.join(temp_dir, "prefixes", gameid)
-        if os.path.isdir(src):
-            shutil.copytree(src, dst, dirs_exist_ok=True, symlinks=True, copy_function=_link_or_copy)
-        manifest["prefixes"].append({
-            "gameid": gameid,
-            "title": prefix_info["title"],
-            "original_path": src,
-        })
+        faugus_roots = {
+            "config": os.path.realpath(os.path.dirname(CONFIG_FILE_DIR)),
+            "data": os.path.realpath(FAUGUS_LAUNCHER_SHARE_DIR),
+            "state": os.path.realpath(FAUGUS_LAUNCHER_STATE_DIR),
+        }
+        for root_name, root_path in faugus_roots.items():
+            _raise_if_backup_cancelled()
+            if not os.path.isdir(root_path):
+                continue
+            dst_root = os.path.join(settings_dir, root_name)
+            for entry in os.scandir(root_path):
+                if entry.path == temp_root:
+                    continue
+                os.makedirs(dst_root, exist_ok=True)
+                target = os.path.join(dst_root, entry.name)
+                if entry.name == "games.json":
+                    filtered_games = [g for g in all_games if isinstance(g, dict) and g.get("gameid") in games]
+                    save_json_file(filtered_games, target)
+                elif entry.name in ("covers", "banners", "icons"):
+                    _copy_dir_including(entry.path, target, included_image_basenames)
+                elif entry.is_dir(follow_symlinks=False):
+                    shutil.copytree(entry.path, target, dirs_exist_ok=True, copy_function=_link_or_copy)
+                else:
+                    _link_or_copy(entry.path, target)
 
-    for shortcut_info in shortcuts:
-        gameid = shortcut_info["gameid"]
-        files = shortcut_info.get("files") or []
-        dst_dir = os.path.join(temp_dir, "shortcuts", gameid)
-        if files:
-            os.makedirs(dst_dir, exist_ok=True)
-            for f in files:
-                shutil.copy2(f, os.path.join(dst_dir, os.path.basename(f)))
-        if gameid == "default" and os.path.isdir(SHORTCUT_ICONS_DIR):
-            shutil.copytree(SHORTCUT_ICONS_DIR, os.path.join(dst_dir, "icons"), dirs_exist_ok=True, copy_function=_link_or_copy)
-        manifest["shortcuts"].append({
-            "gameid": gameid,
-            "title": shortcut_info["title"],
-            "original_paths": [str(f) for f in files],
-        })
+        for prefix_info in prefixes:
+            _raise_if_backup_cancelled()
+            gameid = prefix_info["gameid"]
+            src = prefix_info["path"]
+            dst = os.path.join(temp_dir, "prefixes", gameid)
+            if os.path.isdir(src):
+                shutil.copytree(src, dst, dirs_exist_ok=True, symlinks=True, copy_function=_link_or_copy)
+            manifest["prefixes"].append({
+                "gameid": gameid,
+                "title": prefix_info["title"],
+                "original_path": src,
+            })
 
-    for proton_info in protons:
-        gameid = proton_info["gameid"]
-        src = proton_info["path"]
-        dst = os.path.join(temp_dir, "protons", gameid)
-        if os.path.isdir(src):
-            shutil.copytree(src, dst, dirs_exist_ok=True, symlinks=True, copy_function=_link_or_copy)
-        manifest["protons"].append({
-            "gameid": gameid,
-            "title": proton_info["title"],
-            "original_path": src,
-        })
+        for shortcut_info in shortcuts:
+            _raise_if_backup_cancelled()
+            gameid = shortcut_info["gameid"]
+            files = shortcut_info.get("files") or []
+            dst_dir = os.path.join(temp_dir, "shortcuts", gameid)
+            if files:
+                os.makedirs(dst_dir, exist_ok=True)
+                for f in files:
+                    shutil.copy2(f, os.path.join(dst_dir, os.path.basename(f)))
+            if gameid == "default" and os.path.isdir(SHORTCUT_ICONS_DIR):
+                shutil.copytree(SHORTCUT_ICONS_DIR, os.path.join(dst_dir, "icons"), dirs_exist_ok=True, copy_function=_link_or_copy)
+            manifest["shortcuts"].append({
+                "gameid": gameid,
+                "title": shortcut_info["title"],
+                "original_paths": [str(f) for f in files],
+            })
 
-    save_json_file(manifest, os.path.join(temp_dir, "manifest.json"))
+        for proton_info in protons:
+            _raise_if_backup_cancelled()
+            gameid = proton_info["gameid"]
+            src = proton_info["path"]
+            dst = os.path.join(temp_dir, "protons", gameid)
+            if os.path.isdir(src):
+                shutil.copytree(src, dst, dirs_exist_ok=True, symlinks=True, copy_function=_link_or_copy)
+            manifest["protons"].append({
+                "gameid": gameid,
+                "title": proton_info["title"],
+                "original_path": src,
+            })
 
-    marker_path = os.path.join(temp_dir, ".faugus_marker")
-    with open(marker_path, "w") as f:
-        f.write("faugus-launcher-backup")
+        _raise_if_backup_cancelled()
 
-    now = datetime.now()
-    current_date = now.strftime("%Y-%m-%d")
-    zip_path = os.path.join(FAUGUS_TEMP, f"faugus-launcher-{current_date}")
+        save_json_file(manifest, os.path.join(temp_dir, "manifest.json"))
 
-    shutil.make_archive(zip_path, "tar", temp_dir)
-    shutil.rmtree(temp_dir)
+        marker_path = os.path.join(temp_dir, ".faugus_marker")
+        with open(marker_path, "w") as f:
+            f.write("faugus-launcher-backup")
 
-    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-    if os.path.exists(dest_path):
-        os.remove(dest_path)
+        now = datetime.now()
+        current_date = now.strftime("%Y-%m-%d")
+        zip_path = os.path.join(FAUGUS_TEMP, f"faugus-launcher-{current_date}")
 
-    shutil.move(zip_path + ".tar", dest_path)
+        shutil.make_archive(zip_path, "tar", temp_dir)
+        shutil.rmtree(temp_dir)
 
-    return now.strftime("%Y-%m-%d %H:%M")
+        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+        if os.path.exists(dest_path):
+            os.remove(dest_path)
+
+        shutil.move(zip_path + ".tar", dest_path)
+
+        return now.strftime("%Y-%m-%d %H:%M")
+    except BackupCancelled:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
+    finally:
+        for state_file in (BACKUP_LOCK_FILE, BACKUP_CANCEL_FILE):
+            try:
+                os.remove(state_file)
+            except OSError:
+                pass
 
 
 def resolve_excluded_ids(config, new_key, old_key, all_ids):
@@ -389,13 +466,17 @@ def backup_selection_from_config(config):
 
 def run_backup_with_notification(dest_path, prefixes, shortcuts=None, protons=None, games=None):
     send_desktop_notification("Faugus", _("Backup started"))
-    new_date = perform_backup(
-        dest_path,
-        prefixes=prefixes,
-        shortcuts=shortcuts,
-        protons=protons,
-        games=games,
-    )
+    try:
+        new_date = perform_backup(
+            dest_path,
+            prefixes=prefixes,
+            shortcuts=shortcuts,
+            protons=protons,
+            games=games,
+        )
+    except BackupCancelled:
+        send_desktop_notification("Faugus", _("Backup cancelled"))
+        return None
     send_desktop_notification("Faugus", _("Backup completed"))
     return new_date
 
@@ -425,7 +506,22 @@ def _perform_scheduled_backup(config):
     dest_dir = config.get('backup-dest-dir', '') or os.path.expanduser("~")
     dest_path = os.path.join(dest_dir, backup_filename())
     prefixes, shortcuts, protons, games = backup_selection_from_config(config)
+
+    needed_bytes = estimate_backup_size_bytes(prefixes, shortcuts, protons)
+    free_bytes = get_free_space_bytes(expand_path(dest_dir))
+    if free_bytes is not None and needed_bytes > free_bytes:
+        send_desktop_notification(
+            "Faugus",
+            _("Backup failed: not enough disk space ({} needed, {} available).").format(
+                format_size(needed_bytes), format_size(free_bytes)),
+        )
+        suppress_immediate_auto_backup(config)
+        return
+
     new_date = run_backup_with_notification(dest_path, prefixes, shortcuts, protons, games)
+    if new_date is None:
+        suppress_immediate_auto_backup(config)
+        return
     config['backup-last-date'] = new_date
     config['backup-last-auto-date'] = new_date
     save_config(config)
@@ -439,7 +535,8 @@ def _run_scheduled_backup_if_due(config):
         try:
             _perform_scheduled_backup(config)
         except Exception:
-            pass
+            send_desktop_notification("Faugus", _("Backup failed."))
+            suppress_immediate_auto_backup(config)
 
     run_in_background(worker)
 
@@ -616,12 +713,13 @@ def daemon_mode():
         now = time.monotonic()
         if now - last_check >= 60:
             last_check = now
+            config = load_config()
             try:
-                config = load_config()
                 if should_run_backup(config):
                     _perform_scheduled_backup(config)
             except Exception:
-                pass
+                send_desktop_notification("Faugus", _("Backup failed."))
+                suppress_immediate_auto_backup(config)
         time.sleep(5)
 
 
