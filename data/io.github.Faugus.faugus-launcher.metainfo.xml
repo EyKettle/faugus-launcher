@@ -65,7 +65,7 @@
       <caption>Main window: Covers interface mode</caption>
     </screenshot>
     <screenshot>
-      <image>https://raw.githubusercontent.com/Faugus/faugus-launcher/f85d84a/screenshots/main-carrousel.png</image>
+      <image>https://raw.githubusercontent.com/Faugus/faugus-launcher/e7e0fbc/screenshots/main-carrousel.png</image>
       <caption>Main window: Carrousel interface mode</caption>
     </screenshot>
     <screenshot>
@@ -81,8 +81,12 @@
       <caption>Add/Edit Game: Launch Settings</caption>
     </screenshot>
     <screenshot>
-      <image>https://raw.githubusercontent.com/Faugus/faugus-launcher/e54c4d4/screenshots/settings.png</image>
-      <caption>Settings</caption>
+      <image>https://raw.githubusercontent.com/Faugus/faugus-launcher/e7e0fbc/screenshots/settings-general.png</image>
+      <caption>Settings: General</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/Faugus/faugus-launcher/723c6d3/screenshots/settings-interface.png</image>
+      <caption>Settings: Interface</caption>
     </screenshot>
     <screenshot>
       <image>https://raw.githubusercontent.com/Faugus/faugus-launcher/f82eba2/screenshots/proton-manager.png</image>
@@ -90,17 +94,15 @@
     </screenshot>
   </screenshots>
   <releases>
-    <release version="2.3.0-1" date="2026-09-10">
+    <release version="2.4.2-1" date="2026-09-26">
       <description>
         <ul>
-          <li>Added an option to run an installer when adding a new game. It automatically grabs the path of the game executable after the installation.</li>
-          <li>Added an option to automatically create shortcuts when installing something through the file manager.</li>
-          <li>The features above are not always 100% accurate because the path is obtained from shortcuts created by Windows and sometimes more than one shortcut is created, which can cause the algorithm to select the wrong path.</li>
-          <li>Added support for Proton-Wineland, which aims to make Windows games and their supporting applications feel at home on a Wayland desktop.</li>
-          <li>Now you can drag and drop a file onto the launcher to start adding a new game.</li>
-          <li>Added a field to search for other SteamGridDB assets.</li>
-          <li>Reworked to allow editing the game title.</li>
-          <li>Show a message asking whether to discard the prefix created when canceling a new game addition.</li>
+          <li>Now disables automatic updates when disabling the runtime for Linux games.</li>
+          <li>Added an option to select a custom color for the Overview and the Background.</li>
+          <li>Fixed working directory missing when launching games through the system tray menu.</li>
+          <li>Updated the Flatpak build to GNOME 51.</li>
+          <li>Fixed a regression that caused the "Stop" button not to work on Flatpak.</li>
+          <li>Removed the Wine dependency from the Flatpak build as it's no longer needed. This significantly reduces the build size.</li>
           <li>Updated translations.</li>
         </ul>
       </description>

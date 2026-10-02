@@ -15,7 +15,7 @@ gi.require_version("Gtk", "4.0")
 
 from gi.repository import Gtk, GLib
 from faugus.language_config import *
-from faugus.utils import widget_children, hide_dialog_action_area, destroy_and_release, run_in_background, IdComboBox, apply_titlebar_preference, get_effective_accent_rgb
+from faugus.utils import widget_children, hide_dialog_action_area, run_in_background, idle_add_while_open, IdComboBox, apply_titlebar_preference, get_effective_accent_rgb
 
 if IS_FLATPAK:
     GLib.set_prgname("io.github.Faugus.faugus-launcher")
@@ -29,14 +29,14 @@ VARIANTS = {
         "tab_label": "Proton-CachyOS",
         "api_url": "https://api.github.com/repos/CachyOS/proton-cachyos/releases",
         "tag_prefix": "cachyos-",
-        "archive_ext": ["x86_64.tar.xz"],
+        "archive_ext": ("x86_64.tar.xz",),
         "tag_to_display": lambda tag: f"Proton-CachyOS-{tag.removeprefix('cachyos-')}",
     },
     "ge": {
         "tab_label": "GE-Proton",
         "api_url": "https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases",
         "tag_prefix": "GE-Proton",
-        "archive_ext": [".tar.gz", ".tar.xz"],
+        "archive_ext": (".tar.gz", ".tar.xz"),
         "min_version": (9, 1),
         "tag_to_display": lambda tag: tag,
     },
@@ -44,21 +44,21 @@ VARIANTS = {
         "tab_label": "Proton-EM",
         "api_url": "https://api.github.com/repos/Etaash-mathamsetty/Proton/releases",
         "tag_prefix": "EM-",
-        "archive_ext": [".tar.xz"],
+        "archive_ext": (".tar.xz",),
         "tag_to_display": lambda tag: f"proton-{tag}",
     },
     "dw": {
         "tab_label": "DW-Proton",
         "api_url": "https://dawn.wine/api/v1/repos/dawn-winery/dwproton/releases",
         "tag_prefix": "dwproton-",
-        "archive_ext": ["x86_64.tar.xz"],
+        "archive_ext": ("x86_64.tar.xz",),
         "tag_to_display": lambda tag: f"DW-Proton-{tag.removeprefix('dwproton-')}",
     },
     "wineland": {
         "tab_label": "Proton-Wineland",
         "api_url": "https://api.github.com/repos/nanomatters/proton-cachyos/releases",
         "tag_prefix": "",
-        "archive_ext": ["x86_64.tar.xz"],
+        "archive_ext": ("x86_64.tar.xz",),
         "tag_to_display": lambda tag: f"Proton-Wineland-{tag.removeprefix('cachyos-wineland-').removeprefix('wineland-')}",
     },
 }
@@ -203,10 +203,7 @@ class ProtonDownloader(Gtk.Dialog):
                             continue
 
                     assets = release.get("assets", [])
-                    has_valid_asset = any(
-                        any(asset["name"].endswith(ext) for ext in variant["archive_ext"])
-                        for asset in assets
-                    )
+                    has_valid_asset = any(asset["name"].endswith(variant["archive_ext"]) for asset in assets)
                     if not has_valid_asset:
                         continue
 
@@ -233,7 +230,8 @@ class ProtonDownloader(Gtk.Dialog):
         version_path = self.get_installed_path(tag_name, variant)
         is_installed = version_path.exists()
 
-        button = Gtk.Button(label=_("Remove") if is_installed else _("Download"))
+        button = Gtk.Button()
+        self.set_button_label(button, _("Remove") if is_installed else _("Download"))
         button.connect("clicked", self.on_button_clicked, release, variant)
         button.set_size_request(120, -1)
         button.download_cancel_event = None
@@ -258,16 +256,17 @@ class ProtonDownloader(Gtk.Dialog):
                 if not folder.is_dir():
                     continue
                 fn_lower = folder.name.lower()
-                if fn_lower == tag_lower or fn_lower == display_lower:
-                    return folder
                 if tag_lower in fn_lower or display_lower in fn_lower:
                     return folder
 
         return COMPATIBILITY_DIR / display_name
 
-    def update_button(self, button, new_label):
-        button.set_label(new_label)
-        button.set_sensitive(True)
+    def set_button_label(self, button, label):
+        button.set_label(label)
+        if label == _("Remove"):
+            button.add_css_class("destructive-action")
+        else:
+            button.remove_css_class("destructive-action")
 
     def set_button_progress(self, button, fraction):
         provider = button.progress_css_provider
@@ -321,17 +320,13 @@ class ProtonDownloader(Gtk.Dialog):
         cancel_event = threading.Event()
         button.download_cancel_event = cancel_event
 
-        button.set_label(_("Cancel"))
+        self.set_button_label(button, _("Cancel"))
         self.set_button_progress(button, 0)
-
-        def safe_idle_add(*args):
-            if not closed_event.is_set():
-                GLib.idle_add(*args)
 
         def finish(new_label):
             self.clear_button_progress(button)
             button.download_cancel_event = None
-            button.set_label(new_label)
+            self.set_button_label(button, new_label)
 
         def worker():
             try:
@@ -349,50 +344,33 @@ class ProtonDownloader(Gtk.Dialog):
                     pct = int(frac * 1000)
                     if pct != last_pct[0]:
                         last_pct[0] = pct
-                        safe_idle_add(self.set_button_progress, button, frac)
+                        idle_add_while_open(closed_event, self.set_button_progress, button, frac)
 
                 stream = _StreamProgress(response.raw, total_size, _progress)
 
                 with tarfile.open(fileobj=stream, mode=get_tar_mode(filename)) as tar:
                     tar.extractall(path=COMPATIBILITY_DIR, filter="fully_trusted")
 
-                safe_idle_add(finish, _("Remove"))
+                idle_add_while_open(closed_event, finish, _("Remove"))
 
             except _DownloadCancelled:
                 version_path = self.get_installed_path(tag_name, variant)
-                if version_path and version_path.exists():
+                if version_path.exists():
                     shutil.rmtree(version_path, ignore_errors=True)
-                safe_idle_add(finish, _("Download"))
+                idle_add_while_open(closed_event, finish, _("Download"))
 
             except Exception as e:
                 print(f"Error during download/extraction: {e}")
-                safe_idle_add(finish, _("Download"))
+                idle_add_while_open(closed_event, finish, _("Download"))
 
         run_in_background(worker)
 
     def on_remove_clicked(self, widget, release, variant):
         tag_name = release["tag_name"]
         version_path = self.get_installed_path(tag_name, variant)
-        if version_path and version_path.exists():
+        if version_path.exists():
             try:
                 shutil.rmtree(version_path)
-                self.update_button(widget, _("Download"))
+                self.set_button_label(widget, _("Download"))
             except Exception:
                 pass
-
-
-def main():
-    app = Gtk.Application()
-
-    def on_activate(app):
-        win = ProtonDownloader()
-        win.connect("response", lambda d, r: (d.closed_event.set(), destroy_and_release(d)))
-        win.connect("destroy", lambda *a: app.quit())
-        win.present()
-
-    app.connect("activate", on_activate)
-    app.run(None)
-
-
-if __name__ == "__main__":
-    main()
